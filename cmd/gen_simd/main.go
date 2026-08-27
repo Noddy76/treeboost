@@ -272,7 +272,7 @@ func generateWeightedSumAVX512() {
 	remInit := GP64()
 	MOVQ(n, remInit)
 	CMPQ(remInit, U8(8))
-	JLT(LabelRef("tail"))
+	JLT(LabelRef("reduce"))
 
 	Label("loop")
 
@@ -362,51 +362,58 @@ func generateWeightedSumAVX512() {
 	CMPQ(rem, U8(8))
 	JGE(LabelRef("loop"))
 
-	Label("tail")
-	CMPQ(idx, n)
-	JGE(LabelRef("reduce"))
-
-	tailIdx := GP64()
-	MOVQ(Mem{Base: idxPtr, Index: idx, Scale: 8}, tailIdx)
-
-	wTailX := XMM()
-	yTailX := XMM()
-	VMOVSD(Mem{Base: wPtr, Index: tailIdx, Scale: 8}, wTailX)
-	VMOVSD(Mem{Base: yPtr, Index: tailIdx, Scale: 8}, yTailX)
-
-	VADDSD(wTailX, sumWAcc.AsX(), sumWAcc.AsX())
-	VFMADD231SD(yTailX, wTailX, sumWYAcc.AsX())
-
-	INCQ(idx)
-	JMP(LabelRef("tail"))
-
 	Label("reduce")
 	wRedHiY := YMM()
 	yRedHiY := YMM()
 	VEXTRACTF64X4(U8(1), sumWAcc, wRedHiY)
 	VEXTRACTF64X4(U8(1), sumWYAcc, yRedHiY)
 
-	VADDPD(wRedHiY, sumWAcc.AsY(), sumWAcc.AsY())
-	VADDPD(yRedHiY, sumWYAcc.AsY(), sumWYAcc.AsY())
+	wLoYAcc := sumWAcc.AsY()
+	yLoYAcc := sumWYAcc.AsY()
+	VADDPD(wRedHiY, wLoYAcc, wLoYAcc)
+	VADDPD(yRedHiY, yLoYAcc, yLoYAcc)
 
 	wHiX := XMM()
 	yHiX := XMM()
-	VEXTRACTF128(U8(1), sumWAcc.AsY(), wHiX)
-	VEXTRACTF128(U8(1), sumWYAcc.AsY(), yHiX)
+	VEXTRACTF128(U8(1), wLoYAcc, wHiX)
+	VEXTRACTF128(U8(1), yLoYAcc, yHiX)
 
-	VADDPD(wHiX, sumWAcc.AsX(), sumWAcc.AsX())
-	VADDPD(yHiX, sumWYAcc.AsX(), sumWYAcc.AsX())
+	wLoXAcc := sumWAcc.AsX()
+	yLoXAcc := sumWYAcc.AsX()
+	VADDPD(wHiX, wLoXAcc, wLoXAcc)
+	VADDPD(yHiX, yLoXAcc, yLoXAcc)
 
 	wUpper := XMM()
 	yUpper := XMM()
-	VUNPCKHPD(sumWAcc.AsX(), sumWAcc.AsX(), wUpper)
-	VUNPCKHPD(sumWYAcc.AsX(), sumWYAcc.AsX(), yUpper)
+	VUNPCKHPD(wLoXAcc, wLoXAcc, wUpper)
+	VUNPCKHPD(yLoXAcc, yLoXAcc, yUpper)
 
-	VADDSD(wUpper, sumWAcc.AsX(), sumWAcc.AsX())
-	VADDSD(yUpper, sumWYAcc.AsX(), sumWYAcc.AsX())
+	VADDSD(wUpper, wLoXAcc, wLoXAcc)
+	VADDSD(yUpper, yLoXAcc, yLoXAcc)
 
-	Store(sumWAcc.AsX(), Return("sumW"))
-	Store(sumWYAcc.AsX(), Return("sumWY"))
+	Label("tail_check")
+	CMPQ(idx, n)
+	JGE(LabelRef("done"))
+
+	Label("tail_loop")
+	tailIdx := GP64()
+	MOVQ(Mem{Base: idxPtr, Index: idx, Scale: 8}, tailIdx)
+
+	wTail := XMM()
+	yTail := XMM()
+	VMOVSD(Mem{Base: wPtr, Index: tailIdx, Scale: 8}, wTail)
+	VMOVSD(Mem{Base: yPtr, Index: tailIdx, Scale: 8}, yTail)
+
+	VADDSD(wTail, wLoXAcc, wLoXAcc)
+	VFMADD231SD(yTail, wTail, yLoXAcc)
+
+	INCQ(idx)
+	CMPQ(idx, n)
+	JLT(LabelRef("tail_loop"))
+
+	Label("done")
+	Store(wLoXAcc, Return("sumW"))
+	Store(yLoXAcc, Return("sumWY"))
 
 	VZEROUPPER()
 	RET()
@@ -473,7 +480,7 @@ func generateWeightedSumContiguousAVX512() {
 	MOVQ(n, rem8Check)
 	SUBQ(idx, rem8Check)
 	CMPQ(rem8Check, U8(8))
-	JLT(LabelRef("tail_check"))
+	JLT(LabelRef("reduce"))
 
 	Label("loop8")
 	wVec8 := ZMM()
@@ -484,21 +491,6 @@ func generateWeightedSumContiguousAVX512() {
 	VFMADD231PD(yVec8, wVec8, sumWY0)
 	ADDQ(U8(8), idx)
 
-	Label("tail_check")
-	CMPQ(idx, n)
-	JGE(LabelRef("reduce"))
-
-	Label("tail_loop")
-	wTailX := XMM()
-	yTailX := XMM()
-	VMOVSD(Mem{Base: wPtr, Index: idx, Scale: 8}, wTailX)
-	VMOVSD(Mem{Base: yPtr, Index: idx, Scale: 8}, yTailX)
-	VADDSD(wTailX, sumW0.AsX(), sumW0.AsX())
-	VFMADD231SD(yTailX, wTailX, sumWY0.AsX())
-	INCQ(idx)
-	CMPQ(idx, n)
-	JLT(LabelRef("tail_loop"))
-
 	Label("reduce")
 	VADDPD(sumW1, sumW0, sumW0)
 	VADDPD(sumWY1, sumWY0, sumWY0)
@@ -508,27 +500,47 @@ func generateWeightedSumContiguousAVX512() {
 	VEXTRACTF64X4(U8(1), sumW0, wHiY)
 	VEXTRACTF64X4(U8(1), sumWY0, yHiY)
 
-	VADDPD(wHiY, sumW0.AsY(), sumW0.AsY())
-	VADDPD(yHiY, sumWY0.AsY(), sumWY0.AsY())
+	wLoY := sumW0.AsY()
+	yLoY := sumWY0.AsY()
+	VADDPD(wHiY, wLoY, wLoY)
+	VADDPD(yHiY, yLoY, yLoY)
 
 	wHiX := XMM()
 	yHiX := XMM()
-	VEXTRACTF128(U8(1), sumW0.AsY(), wHiX)
-	VEXTRACTF128(U8(1), sumWY0.AsY(), yHiX)
+	VEXTRACTF128(U8(1), wLoY, wHiX)
+	VEXTRACTF128(U8(1), yLoY, yHiX)
 
-	VADDPD(wHiX, sumW0.AsX(), sumW0.AsX())
-	VADDPD(yHiX, sumWY0.AsX(), sumWY0.AsX())
+	wLoX := sumW0.AsX()
+	yLoX := sumWY0.AsX()
+	VADDPD(wHiX, wLoX, wLoX)
+	VADDPD(yHiX, yLoX, yLoX)
 
 	wUpper := XMM()
 	yUpper := XMM()
-	VUNPCKHPD(sumW0.AsX(), sumW0.AsX(), wUpper)
-	VUNPCKHPD(sumWY0.AsX(), sumWY0.AsX(), yUpper)
+	VUNPCKHPD(wLoX, wLoX, wUpper)
+	VUNPCKHPD(yLoX, yLoX, yUpper)
 
-	VADDSD(wUpper, sumW0.AsX(), sumW0.AsX())
-	VADDSD(yUpper, sumWY0.AsX(), sumWY0.AsX())
+	VADDSD(wUpper, wLoX, wLoX)
+	VADDSD(yUpper, yLoX, yLoX)
 
-	Store(sumW0.AsX(), Return("sumW"))
-	Store(sumWY0.AsX(), Return("sumWY"))
+	Label("tail_check")
+	CMPQ(idx, n)
+	JGE(LabelRef("done"))
+
+	Label("tail_loop")
+	wTail := XMM()
+	yTail := XMM()
+	VMOVSD(Mem{Base: wPtr, Index: idx, Scale: 8}, wTail)
+	VMOVSD(Mem{Base: yPtr, Index: idx, Scale: 8}, yTail)
+	VADDSD(wTail, wLoX, wLoX)
+	VFMADD231SD(yTail, wTail, yLoX)
+	INCQ(idx)
+	CMPQ(idx, n)
+	JLT(LabelRef("tail_loop"))
+
+	Label("done")
+	Store(wLoX, Return("sumW"))
+	Store(yLoX, Return("sumWY"))
 
 	VZEROUPPER()
 	RET()

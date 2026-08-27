@@ -15,7 +15,7 @@ TEXT ·computeWeightedSumAVX512(SB), NOSPLIT, $0-88
 	XORQ   SI, SI
 	MOVQ   BX, DI
 	CMPQ   DI, $0x08
-	JLT    tail
+	JLT    reduce
 
 loop:
 	MOVQ         (DX)(SI*8), DI
@@ -66,17 +66,6 @@ loop:
 	CMPQ         DI, $0x08
 	JGE          loop
 
-tail:
-	CMPQ        SI, BX
-	JGE         reduce
-	MOVQ        (DX)(SI*8), DI
-	VMOVSD      (AX)(DI*8), X2
-	VMOVSD      (CX)(DI*8), X3
-	VADDSD      X2, X0, X0
-	VFMADD231SD X3, X2, X1
-	INCQ        SI
-	JMP         tail
-
 reduce:
 	VEXTRACTF64X4 $0x01, Z0, Y2
 	VEXTRACTF64X4 $0x01, Z1, Y3
@@ -90,8 +79,22 @@ reduce:
 	VUNPCKHPD     X1, X1, X3
 	VADDSD        X2, X0, X0
 	VADDSD        X3, X1, X1
-	MOVSD         X0, sumW+72(FP)
-	MOVSD         X1, sumWY+80(FP)
+	CMPQ          SI, BX
+	JGE           done
+
+tail_loop:
+	MOVQ        (DX)(SI*8), DI
+	VMOVSD      (AX)(DI*8), X2
+	VMOVSD      (CX)(DI*8), X3
+	VADDSD      X2, X0, X0
+	VFMADD231SD X3, X2, X1
+	INCQ        SI
+	CMPQ        SI, BX
+	JLT         tail_loop
+
+done:
+	MOVSD X0, sumW+72(FP)
+	MOVSD X1, sumWY+80(FP)
 	VZEROUPPER
 	RET
 
@@ -133,25 +136,12 @@ loop8_check:
 	MOVQ        DX, SI
 	SUBQ        BX, SI
 	CMPQ        SI, $0x08
-	JLT         tail_check
+	JLT         reduce
 	VMOVUPD     (AX)(BX*8), Z4
 	VMOVUPD     (CX)(BX*8), Z5
 	VADDPD      Z4, Z0, Z0
 	VFMADD231PD Z5, Z4, Z2
 	ADDQ        $0x08, BX
-
-tail_check:
-	CMPQ BX, DX
-	JGE  reduce
-
-tail_loop:
-	VMOVSD      (AX)(BX*8), X4
-	VMOVSD      (CX)(BX*8), X5
-	VADDSD      X4, X0, X0
-	VFMADD231SD X5, X4, X2
-	INCQ        BX
-	CMPQ        BX, DX
-	JLT         tail_loop
 
 reduce:
 	VADDPD        Z1, Z0, Z0
@@ -168,8 +158,21 @@ reduce:
 	VUNPCKHPD     X2, X2, X3
 	VADDSD        X1, X0, X0
 	VADDSD        X3, X2, X2
-	MOVSD         X0, sumW+48(FP)
-	MOVSD         X2, sumWY+56(FP)
+	CMPQ          BX, DX
+	JGE           done
+
+tail_loop:
+	VMOVSD      (AX)(BX*8), X1
+	VMOVSD      (CX)(BX*8), X3
+	VADDSD      X1, X0, X0
+	VFMADD231SD X3, X1, X2
+	INCQ        BX
+	CMPQ        BX, DX
+	JLT         tail_loop
+
+done:
+	MOVSD X0, sumW+48(FP)
+	MOVSD X2, sumWY+56(FP)
 	VZEROUPPER
 	RET
 
