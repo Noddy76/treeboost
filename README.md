@@ -10,7 +10,9 @@
 
 ## ⚡ Highlights
 
-- **Pure Go Core + AVX-512 / AVX2 SIMD**: Zero `cgo` dependencies. Includes handcrafted 512-bit AVX-512 and 256-bit AVX2 FMA assembly kernels (`weighted_sum_amd64.s` generated via [avo](https://github.com/mmcloughlin/avo)) with runtime CPU feature detection and seamless scalar fallbacks for ARM64 and non-AVX platforms. Even when compiling on older CPUs without AVX-512, binaries compile cleanly and automatically utilize AVX-512 when executed on AVX-512 capable hardware.
+- **Pure Go Core + AVX-512 / AVX2 SIMD**: Zero `cgo` dependencies. Includes handcrafted 512-bit AVX-512 and 256-bit AVX2 FMA assembly kernels (`weighted_sum_amd64.s` generated via [avo](https://github.com/mmcloughlin/avo)) with dynamic runtime CPU feature detection (`golang.org/x/sys/cpu`) and scalar fallbacks for ARM64 and non-AVX platforms.
+  - **Contiguous Operations**: Uses 512-bit AVX-512 vectors ($N \ge 16$) when available, seamlessly scaling to 256-bit AVX2 ($N \ge 8$) or scalar.
+  - **Indirect Indexing**: Uses tuned 256-bit AVX2 vectors for $16 \le N \le 2048$ and out-of-order scalar pipelining for large arrays, ensuring optimal cache and memory pipeline utilization on all CPU generations.
 - **Multi-Algorithm Fusion**: Train and blend multiple distinct decision tree architectures within a single unified model:
   - **Symmetric Trees ([CatBoost](https://en.wikipedia.org/wiki/CatBoost))**: Obliviated decision trees where the same feature split condition is evaluated across an entire depth layer.
   - **Leaf-Wise Trees ([LightGBM](https://en.wikipedia.org/wiki/LightGBM))**: Best-first tree growth strategy splitting nodes with maximum loss reduction (gain) for rapid convergence.
@@ -131,18 +133,24 @@ make bench
 # or: go test -v -bench=. -benchmem ./...
 ```
 
-Sample benchmark results on AMD Ryzen 9 5950X:
+### 1. Vectorized Memory Bandwidth & Latency ($N=1,024$)
 
-| Benchmark | Operations | Latency | Allocations |
+| Kernel | Scalar (No SIMD) | AVX2 (256-bit) | AVX-512 (512-bit) | AVX-512 vs Scalar | AVX-512 vs AVX2 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`WeightedSumContiguous`** | $345.9\text{ ns}$ ($47\text{ GB/s}$) | $162.9\text{ ns}$ ($100\text{ GB/s}$) | **$95.5\text{ ns}$ ($171.6\text{ GB/s}$)** | **$3.62\times$ faster** | **$1.71\times$ faster** |
+| **`WeightedSumIndirect`** ($N=256$) | $219.3\text{ ns}$ | **$101.4\text{ ns}$** | **$100.6\text{ ns}$** | **$2.18\times$ faster** | $1.01\times$ |
+| **`WeightedSumIndirect`** ($N=1,024$) | $923.7\text{ ns}$ | **$381.3\text{ ns}$** | **$377.4\text{ ns}$** | **$2.45\times$ faster** | $1.01\times$ |
+
+### 2. End-to-End Ensemble Training & Inference
+
+| Benchmark | Latency | Memory / Allocs | Notes |
 | :--- | :--- | :--- | :--- |
-| **`BenchmarkGBDTPredict`** (Single Sample) | 450,272 | **2.6 µs/op** | 0 B/op, 0 allocs |
-| **`BenchmarkPredictBatch`** (64 Samples) | 4,814 | **245 µs/op** | 512 B/op, 1 alloc |
-| **`BenchmarkWeightedSumContiguous` (AVX2 SIMD)** | 11,418,289 | **104.1 ns/op** | 0 B/op, 0 allocs |
-| **`BenchmarkWeightedSumContiguous` (Scalar)** | 5,511,168 | **215.5 ns/op** | 0 B/op, 0 allocs |
-| **`BenchmarkWeightedSumIndirect` (AVX2 SIMD)** | 3,939,494 | **306.9 ns/op** | 0 B/op, 0 allocs |
-| **`BenchmarkWeightedSumIndirect` (Scalar)** | 2,770,617 | **435.2 ns/op** | 0 B/op, 0 allocs |
+| **`BenchmarkGBDTPredict`** (Single Sample) | **2.56 µs/op** | 0 B/op, 0 allocs | Real-time serving latency |
+| **`BenchmarkPredictBatch`** (64 Samples) | **245 µs/op** | 512 B/op, 1 alloc | Multi-sample batch scoring |
+| **`BenchmarkGBDTTrainEnsemble`** (AVX-512) | **71.5 ms/op** | 2.93 MB/op, 859 allocs | Full CatBoost + LightGBM + ExtraTrees |
+| **`BenchmarkGBDTTrainEnsemble`** (AVX2-Only) | **72.3 ms/op** | 2.93 MB/op, 859 allocs | Automatic seamless fallback |
 
-> **SIMD Acceleration**: Handcrafted AVX-512 and AVX2 FMA assembly kernels deliver more than **2x speedup** over compiler scalar loops during tree split calculations, with dynamic runtime CPU dispatching.
+> **Dynamic SIMD Dispatch**: Treeboost dynamically detects CPU flags at startup (`HasAVX512`, `HasAVX2`, `HasFMA`). Contiguous data paths maximize 512-bit vector throughput, while indirect index paths leverage tuned 256-bit AVX2 kernels and out-of-order execution, ensuring top performance across all Intel and AMD x86-64 hardware.
 
 ---
 

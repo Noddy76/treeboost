@@ -538,6 +538,97 @@ func TestCPUFeatureDetection(t *testing.T) {
 	t.Logf("CPU Feature Detection -> AVX2: %v, AVX-512: %v", hasAVX2, hasAVX512)
 }
 
+func TestSimulatedCPUEnvironments(t *testing.T) {
+	origAVX512 := hasAVX512
+	origAVX2 := hasAVX2
+	defer func() {
+		hasAVX512 = origAVX512
+		hasAVX2 = origAVX2
+	}()
+
+	testCases := []struct {
+		name      string
+		simAVX512 bool
+		simAVX2   bool
+	}{
+		{"AVX512_Enabled", true, true},
+		{"AVX2_Only", false, true},
+		{"Scalar_Only", false, false},
+	}
+
+	testSizes := []int{0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 127, 256, 1024}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.simAVX512 && !origAVX512 {
+				t.Skip("Host does not support AVX-512")
+			}
+			if tc.simAVX2 && !origAVX2 {
+				t.Skip("Host does not support AVX2")
+			}
+
+			hasAVX512 = tc.simAVX512
+			hasAVX2 = tc.simAVX2
+
+			// 1. Check Contiguous Weighted Sum
+			for _, n := range testSizes {
+				W := make([]float64, n)
+				Y := make([]float64, n)
+				for i := 0; i < n; i++ {
+					W[i] = float64(i+1)*0.25 + 0.1
+					Y[i] = float64((i*23)%47) - 20.0
+				}
+				sumWScalar, sumWYScalar := computeWeightedSumContiguousScalar(W, Y)
+				sumWDisp, sumWYDisp := computeWeightedSumContiguous(W, Y)
+				if math.Abs(sumWScalar-sumWDisp) > 1e-5 || math.Abs(sumWYScalar-sumWYDisp) > 1e-5 {
+					t.Fatalf("[%s] Size %d contiguous mismatch: scalar=(%f, %f), disp=(%f, %f)",
+						tc.name, n, sumWScalar, sumWYScalar, sumWDisp, sumWYDisp)
+				}
+			}
+
+			// 2. Check Indirect Weighted Sum
+			for _, n := range testSizes {
+				W := make([]float64, n)
+				Y := make([]float64, n)
+				indices := make([]int, n)
+				for i := 0; i < n; i++ {
+					W[i] = float64(i+1) * 0.5
+					Y[i] = float64((i*17)%31) - 15.0
+					indices[i] = i
+				}
+				sumWScalar, sumWYScalar := computeWeightedSumScalar(W, Y, indices)
+				sumWDisp, sumWYDisp := computeWeightedSum(W, Y, indices)
+				if math.Abs(sumWScalar-sumWDisp) > 1e-5 || math.Abs(sumWYScalar-sumWYDisp) > 1e-5 {
+					t.Fatalf("[%s] Size %d indirect mismatch: scalar=(%f, %f), disp=(%f, %f)",
+						tc.name, n, sumWScalar, sumWYScalar, sumWDisp, sumWYDisp)
+				}
+			}
+
+			// 3. Check Full Ensemble Training in this mode
+			X := []FeatureVector{
+				{Values: []float64{1.0, 10.0}},
+				{Values: []float64{2.0, 20.0}},
+				{Values: []float64{3.0, 30.0}},
+				{Values: []float64{4.0, 40.0}},
+				{Values: []float64{5.0, 50.0}},
+			}
+			Y := []float64{15.0, 25.0, 35.0, 45.0, 55.0}
+			config := DefaultEnsembleConfig()
+			config.CatBoost.Iterations = 20
+			config.LightGBM.Estimators = 20
+			config.ExtraTrees.Estimators = 20
+			model := TrainEnsemble(X, Y, config)
+			if model == nil {
+				t.Fatalf("[%s] TrainEnsemble returned nil", tc.name)
+			}
+			pred := model.Predict([]float64{3.0, 30.0})
+			if math.IsNaN(pred) || math.IsInf(pred, 0) || math.Abs(pred-35.0) > 5.0 {
+				t.Errorf("[%s] Unexpected prediction: %f", tc.name, pred)
+			}
+		})
+	}
+}
+
 func BenchmarkWeightedSumContiguous(b *testing.B) {
 	n := 1024
 	W := make([]float64, n)

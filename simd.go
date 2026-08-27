@@ -18,10 +18,7 @@ func computeWeightedSumScalar(W []float64, Y []float64, indices []int) (float64,
 }
 
 func computeWeightedSum(W []float64, Y []float64, indices []int) (float64, float64) {
-	if hasAVX512 && len(indices) >= 32 {
-		return computeWeightedSumAVX512(W, Y, indices)
-	}
-	if hasAVX2 && len(indices) >= 16 {
+	if hasAVX2 && len(indices) >= 16 && len(indices) <= 2048 {
 		return computeWeightedSumAVX2(W, Y, indices)
 	}
 	return computeWeightedSumScalar(W, Y, indices)
