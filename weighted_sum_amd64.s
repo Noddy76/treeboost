@@ -2,6 +2,177 @@
 
 #include "textflag.h"
 
+// func computeWeightedSumAVX512(W []float64, Y []float64, indices []int) (sumW float64, sumWY float64)
+// Requires: AVX, AVX512F, FMA3, SSE2
+TEXT ·computeWeightedSumAVX512(SB), NOSPLIT, $0-88
+	MOVQ   W_base+0(FP), AX
+	MOVQ   Y_base+24(FP), CX
+	MOVQ   indices_base+48(FP), DX
+	MOVQ   indices_len+56(FP), BX
+	VZEROUPPER
+	VPXORD Z0, Z0, Z0
+	VPXORD Z1, Z1, Z1
+	XORQ   SI, SI
+	MOVQ   BX, DI
+	CMPQ   DI, $0x08
+	JLT    tail
+
+loop:
+	MOVQ         (DX)(SI*8), DI
+	MOVQ         8(DX)(SI*8), R8
+	MOVQ         16(DX)(SI*8), R9
+	MOVQ         24(DX)(SI*8), R10
+	MOVQ         32(DX)(SI*8), R11
+	MOVQ         40(DX)(SI*8), R12
+	MOVQ         48(DX)(SI*8), R13
+	MOVQ         56(DX)(SI*8), R14
+	VMOVSD       (AX)(DI*8), X2
+	VMOVSD       (AX)(R8*8), X3
+	VUNPCKLPD    X3, X2, X2
+	VMOVSD       (AX)(R9*8), X3
+	VMOVSD       (AX)(R10*8), X4
+	VUNPCKLPD    X4, X3, X3
+	VINSERTF128  $0x01, X3, Y2, Y2
+	VMOVSD       (AX)(R11*8), X3
+	VMOVSD       (AX)(R12*8), X4
+	VUNPCKLPD    X4, X3, X3
+	VMOVSD       (AX)(R13*8), X4
+	VMOVSD       (AX)(R14*8), X7
+	VUNPCKLPD    X7, X4, X4
+	VINSERTF128  $0x01, X4, Y3, Y3
+	VINSERTF64X4 $0x00, Y2, Z5, Z5
+	VINSERTF64X4 $0x01, Y3, Z5, Z5
+	VMOVSD       (CX)(DI*8), X4
+	VMOVSD       (CX)(R8*8), X2
+	VUNPCKLPD    X2, X4, X4
+	VMOVSD       (CX)(R9*8), X2
+	VMOVSD       (CX)(R10*8), X3
+	VUNPCKLPD    X3, X2, X2
+	VINSERTF128  $0x01, X2, Y4, Y4
+	VMOVSD       (CX)(R11*8), X7
+	VMOVSD       (CX)(R12*8), X2
+	VUNPCKLPD    X2, X7, X7
+	VMOVSD       (CX)(R13*8), X2
+	VMOVSD       (CX)(R14*8), X3
+	VUNPCKLPD    X3, X2, X2
+	VINSERTF128  $0x01, X2, Y7, Y7
+	VINSERTF64X4 $0x00, Y4, Z6, Z6
+	VINSERTF64X4 $0x01, Y7, Z6, Z6
+	VADDPD       Z5, Z0, Z0
+	VFMADD231PD  Z6, Z5, Z1
+	ADDQ         $0x08, SI
+	MOVQ         BX, DI
+	SUBQ         SI, DI
+	CMPQ         DI, $0x08
+	JGE          loop
+
+tail:
+	CMPQ        SI, BX
+	JGE         reduce
+	MOVQ        (DX)(SI*8), DI
+	VMOVSD      (AX)(DI*8), X2
+	VMOVSD      (CX)(DI*8), X3
+	VADDSD      X2, X0, X0
+	VFMADD231SD X3, X2, X1
+	INCQ        SI
+	JMP         tail
+
+reduce:
+	VEXTRACTF64X4 $0x01, Z0, Y2
+	VEXTRACTF64X4 $0x01, Z1, Y3
+	VADDPD        Y2, Y0, Y0
+	VADDPD        Y3, Y1, Y1
+	VEXTRACTF128  $0x01, Y0, X2
+	VEXTRACTF128  $0x01, Y1, X3
+	VADDPD        X2, X0, X0
+	VADDPD        X3, X1, X1
+	VUNPCKHPD     X0, X0, X2
+	VUNPCKHPD     X1, X1, X3
+	VADDSD        X2, X0, X0
+	VADDSD        X3, X1, X1
+	MOVSD         X0, sumW+72(FP)
+	MOVSD         X1, sumWY+80(FP)
+	VZEROUPPER
+	RET
+
+// func computeWeightedSumContiguousAVX512(W []float64, Y []float64) (sumW float64, sumWY float64)
+// Requires: AVX, AVX512F, CMOV, FMA3, SSE2
+TEXT ·computeWeightedSumContiguousAVX512(SB), NOSPLIT, $0-64
+	MOVQ    W_base+0(FP), AX
+	MOVQ    Y_base+24(FP), CX
+	MOVQ    W_len+8(FP), DX
+	MOVQ    Y_len+32(FP), BX
+	CMPQ    BX, DX
+	CMOVQLT BX, DX
+	VZEROUPPER
+	VPXORD  Z0, Z0, Z0
+	VPXORD  Z1, Z1, Z1
+	VPXORD  Z2, Z2, Z2
+	VPXORD  Z3, Z3, Z3
+	XORQ    BX, BX
+	MOVQ    DX, SI
+	CMPQ    SI, $0x10
+	JLT     loop8_check
+
+loop16:
+	VMOVUPD     (AX)(BX*8), Z4
+	VMOVUPD     (CX)(BX*8), Z5
+	VADDPD      Z4, Z0, Z0
+	VFMADD231PD Z5, Z4, Z2
+	VMOVUPD     64(AX)(BX*8), Z4
+	VMOVUPD     64(CX)(BX*8), Z5
+	VADDPD      Z4, Z1, Z1
+	VFMADD231PD Z5, Z4, Z3
+	ADDQ        $0x10, BX
+	MOVQ        DX, SI
+	SUBQ        BX, SI
+	CMPQ        SI, $0x10
+	JGE         loop16
+
+loop8_check:
+	MOVQ        DX, SI
+	SUBQ        BX, SI
+	CMPQ        SI, $0x08
+	JLT         tail_check
+	VMOVUPD     (AX)(BX*8), Z4
+	VMOVUPD     (CX)(BX*8), Z5
+	VADDPD      Z4, Z0, Z0
+	VFMADD231PD Z5, Z4, Z2
+	ADDQ        $0x08, BX
+
+tail_check:
+	CMPQ BX, DX
+	JGE  reduce
+
+tail_loop:
+	VMOVSD      (AX)(BX*8), X4
+	VMOVSD      (CX)(BX*8), X5
+	VADDSD      X4, X0, X0
+	VFMADD231SD X5, X4, X2
+	INCQ        BX
+	CMPQ        BX, DX
+	JLT         tail_loop
+
+reduce:
+	VADDPD        Z1, Z0, Z0
+	VADDPD        Z3, Z2, Z2
+	VEXTRACTF64X4 $0x01, Z0, Y1
+	VEXTRACTF64X4 $0x01, Z2, Y3
+	VADDPD        Y1, Y0, Y0
+	VADDPD        Y3, Y2, Y2
+	VEXTRACTF128  $0x01, Y0, X1
+	VEXTRACTF128  $0x01, Y2, X3
+	VADDPD        X1, X0, X0
+	VADDPD        X3, X2, X2
+	VUNPCKHPD     X0, X0, X1
+	VUNPCKHPD     X2, X2, X3
+	VADDSD        X1, X0, X0
+	VADDSD        X3, X2, X2
+	MOVSD         X0, sumW+48(FP)
+	MOVSD         X2, sumWY+56(FP)
+	VZEROUPPER
+	RET
+
 // func computeWeightedSumAVX2(W []float64, Y []float64, indices []int) (sumW float64, sumWY float64)
 // Requires: AVX, FMA3, SSE2
 TEXT ·computeWeightedSumAVX2(SB), NOSPLIT, $0-88

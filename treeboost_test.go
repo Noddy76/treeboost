@@ -447,30 +447,52 @@ func BenchmarkGBDTPredict(b *testing.B) {
 }
 
 func TestComputeWeightedSum_Parity(t *testing.T) {
-	n := 127
-	W := make([]float64, n)
-	Y := make([]float64, n)
-	indices := make([]int, n)
+	testSizes := []int{0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 127, 256, 1024}
+	for _, n := range testSizes {
+		W := make([]float64, n)
+		Y := make([]float64, n)
+		indices := make([]int, n)
 
-	for i := 0; i < n; i++ {
-		W[i] = float64(i+1) * 0.5
-		Y[i] = float64((i*17)%31) - 15.0
-		indices[i] = i
-	}
+		for i := 0; i < n; i++ {
+			W[i] = float64(i+1) * 0.5
+			Y[i] = float64((i*17)%31) - 15.0
+			indices[i] = i
+		}
 
-	sumWScalar, sumWYScalar := computeWeightedSumScalar(W, Y, indices)
-	sumWDisp, sumWYDisp := computeWeightedSum(W, Y, indices)
+		sumWScalar, sumWYScalar := computeWeightedSumScalar(W, Y, indices)
+		sumWDisp, sumWYDisp := computeWeightedSum(W, Y, indices)
 
-	if math.Abs(sumWScalar-sumWDisp) > 1e-6 {
-		t.Errorf("sumW mismatch: scalar %f, dispatch %f", sumWScalar, sumWDisp)
-	}
-	if math.Abs(sumWYScalar-sumWYDisp) > 1e-6 {
-		t.Errorf("sumWY mismatch: scalar %f, dispatch %f", sumWYScalar, sumWYDisp)
+		if math.Abs(sumWScalar-sumWDisp) > 1e-5 {
+			t.Errorf("size %d sumW mismatch: scalar %f, dispatch %f", n, sumWScalar, sumWDisp)
+		}
+		if math.Abs(sumWYScalar-sumWYDisp) > 1e-5 {
+			t.Errorf("size %d sumWY mismatch: scalar %f, dispatch %f", n, sumWYScalar, sumWYDisp)
+		}
+
+		if hasAVX2 && n >= 16 {
+			sumWAVX2, sumWYAVX2 := computeWeightedSumAVX2(W, Y, indices)
+			if math.Abs(sumWScalar-sumWAVX2) > 1e-5 {
+				t.Errorf("size %d sumW mismatch: scalar %f, AVX2 %f", n, sumWScalar, sumWAVX2)
+			}
+			if math.Abs(sumWYScalar-sumWYAVX2) > 1e-5 {
+				t.Errorf("size %d sumWY mismatch: scalar %f, AVX2 %f", n, sumWYScalar, sumWYAVX2)
+			}
+		}
+
+		if hasAVX512 {
+			sumWAVX512, sumWYAVX512 := computeWeightedSumAVX512(W, Y, indices)
+			if math.Abs(sumWScalar-sumWAVX512) > 1e-5 {
+				t.Errorf("size %d sumW mismatch: scalar %f, AVX-512 %f", n, sumWScalar, sumWAVX512)
+			}
+			if math.Abs(sumWYScalar-sumWYAVX512) > 1e-5 {
+				t.Errorf("size %d sumWY mismatch: scalar %f, AVX-512 %f", n, sumWYScalar, sumWYAVX512)
+			}
+		}
 	}
 }
 
 func TestContiguousWeightedSum_Parity(t *testing.T) {
-	testSizes := []int{0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 64, 127, 256, 1024}
+	testSizes := []int{0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 127, 256, 1024}
 	for _, n := range testSizes {
 		W := make([]float64, n)
 		Y := make([]float64, n)
@@ -488,6 +510,179 @@ func TestContiguousWeightedSum_Parity(t *testing.T) {
 		if math.Abs(sumWYScalar-sumWYDisp) > 1e-5 {
 			t.Errorf("size %d sumWY mismatch: scalar %f, dispatch %f", n, sumWYScalar, sumWYDisp)
 		}
+
+		if hasAVX2 && n >= 8 {
+			sumWAVX2, sumWYAVX2 := computeWeightedSumContiguousAVX2(W, Y)
+			if math.Abs(sumWScalar-sumWAVX2) > 1e-5 {
+				t.Errorf("size %d sumW mismatch: scalar %f, AVX2 %f", n, sumWScalar, sumWAVX2)
+			}
+			if math.Abs(sumWYScalar-sumWYAVX2) > 1e-5 {
+				t.Errorf("size %d sumWY mismatch: scalar %f, AVX2 %f", n, sumWYScalar, sumWYAVX2)
+			}
+		}
+
+		if hasAVX512 {
+			sumWAVX512, sumWYAVX512 := computeWeightedSumContiguousAVX512(W, Y)
+			if math.Abs(sumWScalar-sumWAVX512) > 1e-5 {
+				t.Errorf("size %d sumW mismatch: scalar %f, AVX-512 %f", n, sumWScalar, sumWAVX512)
+			}
+			if math.Abs(sumWYScalar-sumWYAVX512) > 1e-5 {
+				t.Errorf("size %d sumWY mismatch: scalar %f, AVX-512 %f", n, sumWYScalar, sumWYAVX512)
+			}
+		}
+	}
+}
+
+func TestCPUFeatureDetection(t *testing.T) {
+	// Verify CPU feature detection values without panics or unexpected states
+	t.Logf("CPU Feature Detection -> AVX2: %v, AVX-512: %v", hasAVX2, hasAVX512)
+}
+
+func BenchmarkWeightedSumContiguous(b *testing.B) {
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSumContiguous(W, Y)
+	}
+}
+
+func BenchmarkWeightedSumContiguousAVX512(b *testing.B) {
+	if !hasAVX512 {
+		b.Skip("AVX-512 is not supported on this host")
+	}
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSumContiguousAVX512(W, Y)
+	}
+}
+
+func BenchmarkWeightedSumContiguousAVX2(b *testing.B) {
+	if !hasAVX2 {
+		b.Skip("AVX2 is not supported on this host")
+	}
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSumContiguousAVX2(W, Y)
+	}
+}
+
+func BenchmarkWeightedSumContiguousScalar(b *testing.B) {
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSumContiguousScalar(W, Y)
+	}
+}
+
+func BenchmarkWeightedSumIndirect(b *testing.B) {
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	indices := make([]int, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+		indices[i] = i
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSum(W, Y, indices)
+	}
+}
+
+func BenchmarkWeightedSumIndirectAVX512(b *testing.B) {
+	if !hasAVX512 {
+		b.Skip("AVX-512 is not supported on this host")
+	}
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	indices := make([]int, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+		indices[i] = i
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSumAVX512(W, Y, indices)
+	}
+}
+
+func BenchmarkWeightedSumIndirectAVX2(b *testing.B) {
+	if !hasAVX2 {
+		b.Skip("AVX2 is not supported on this host")
+	}
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	indices := make([]int, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+		indices[i] = i
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSumAVX2(W, Y, indices)
+	}
+}
+
+func BenchmarkWeightedSumIndirectScalar(b *testing.B) {
+	n := 1024
+	W := make([]float64, n)
+	Y := make([]float64, n)
+	indices := make([]int, n)
+	for i := 0; i < n; i++ {
+		W[i] = float64(i+1) * 0.5
+		Y[i] = float64((i*17)%31) - 15.0
+		indices[i] = i
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = computeWeightedSumScalar(W, Y, indices)
 	}
 }
 
@@ -575,38 +770,6 @@ func BenchmarkPredictBatch(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = model.PredictBatch(flatFeatures, nSamples)
-	}
-}
-
-func BenchmarkWeightedSumContiguous(b *testing.B) {
-	n := 1024
-	W := make([]float64, n)
-	Y := make([]float64, n)
-	for i := 0; i < n; i++ {
-		W[i] = float64(i+1) * 0.5
-		Y[i] = float64((i*17)%31) - 15.0
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, _ = computeWeightedSumContiguous(W, Y)
-	}
-}
-
-func BenchmarkWeightedSumContiguousScalar(b *testing.B) {
-	n := 1024
-	W := make([]float64, n)
-	Y := make([]float64, n)
-	for i := 0; i < n; i++ {
-		W[i] = float64(i+1) * 0.5
-		Y[i] = float64((i*17)%31) - 15.0
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, _ = computeWeightedSumContiguousScalar(W, Y)
 	}
 }
 

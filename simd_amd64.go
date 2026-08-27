@@ -4,6 +4,12 @@
 
 package treeboost
 
+// computeWeightedSumAVX512 is implemented in weighted_sum_amd64.s
+func computeWeightedSumAVX512(W []float64, Y []float64, indices []int) (sumW float64, sumWY float64)
+
+// computeWeightedSumContiguousAVX512 is implemented in weighted_sum_amd64.s
+func computeWeightedSumContiguousAVX512(W []float64, Y []float64) (sumW float64, sumWY float64)
+
 // computeWeightedSumAVX2 is implemented in weighted_sum_amd64.s
 func computeWeightedSumAVX2(W []float64, Y []float64, indices []int) (sumW float64, sumWY float64)
 

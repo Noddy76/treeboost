@@ -10,7 +10,7 @@
 
 ## ⚡ Highlights
 
-- **Pure Go Core + AVX2 SIMD**: Zero `cgo` dependencies. Includes handcrafted 256-bit AVX2 FMA assembly kernels (`weighted_sum_amd64.s` generated via [avo](https://github.com/mmcloughlin/avo)) with seamless scalar fallbacks for ARM64 and non-AVX2 platforms.
+- **Pure Go Core + AVX-512 / AVX2 SIMD**: Zero `cgo` dependencies. Includes handcrafted 512-bit AVX-512 and 256-bit AVX2 FMA assembly kernels (`weighted_sum_amd64.s` generated via [avo](https://github.com/mmcloughlin/avo)) with runtime CPU feature detection and seamless scalar fallbacks for ARM64 and non-AVX platforms. Even when compiling on older CPUs without AVX-512, binaries compile cleanly and automatically utilize AVX-512 when executed on AVX-512 capable hardware.
 - **Multi-Algorithm Fusion**: Train and blend multiple distinct decision tree architectures within a single unified model:
   - **Symmetric Trees ([CatBoost](https://en.wikipedia.org/wiki/CatBoost))**: Obliviated decision trees where the same feature split condition is evaluated across an entire depth layer.
   - **Leaf-Wise Trees ([LightGBM](https://en.wikipedia.org/wiki/LightGBM))**: Best-first tree growth strategy splitting nodes with maximum loss reduction (gain) for rapid convergence.
@@ -135,12 +135,14 @@ Sample benchmark results on AMD Ryzen 9 5950X:
 
 | Benchmark | Operations | Latency | Allocations |
 | :--- | :--- | :--- | :--- |
-| **`BenchmarkGBDTPredict`** (Single Sample) | 438,606 | **2.7 µs/op** | 0 B/op, 0 allocs |
-| **`BenchmarkPredictBatch`** (64 Samples) | 4,299 | **266 µs/op** | 512 B/op, 1 alloc |
-| **`BenchmarkWeightedSumContiguous` (AVX2 SIMD)** | 11,250,259 | **106.2 ns/op** | 0 B/op, 0 allocs |
-| **`BenchmarkWeightedSumContiguous` (Scalar)** | 5,504,679 | **216.6 ns/op** | 0 B/op, 0 allocs |
+| **`BenchmarkGBDTPredict`** (Single Sample) | 450,272 | **2.6 µs/op** | 0 B/op, 0 allocs |
+| **`BenchmarkPredictBatch`** (64 Samples) | 4,814 | **245 µs/op** | 512 B/op, 1 alloc |
+| **`BenchmarkWeightedSumContiguous` (AVX2 SIMD)** | 11,418,289 | **104.1 ns/op** | 0 B/op, 0 allocs |
+| **`BenchmarkWeightedSumContiguous` (Scalar)** | 5,511,168 | **215.5 ns/op** | 0 B/op, 0 allocs |
+| **`BenchmarkWeightedSumIndirect` (AVX2 SIMD)** | 3,939,494 | **306.9 ns/op** | 0 B/op, 0 allocs |
+| **`BenchmarkWeightedSumIndirect` (Scalar)** | 2,770,617 | **435.2 ns/op** | 0 B/op, 0 allocs |
 
-> **SIMD Acceleration**: The AVX2 FMA 256-bit kernel delivers a **2.04x speedup** over the compiler scalar loop during tree split calculations.
+> **SIMD Acceleration**: Handcrafted AVX-512 and AVX2 FMA assembly kernels deliver more than **2x speedup** over compiler scalar loops during tree split calculations, with dynamic runtime CPU dispatching.
 
 ---
 

@@ -2,6 +2,14 @@
 
 package treeboost
 
+func computeWeightedSumAVX512(W []float64, Y []float64, indices []int) (sumW float64, sumWY float64) {
+	return computeWeightedSumScalar(W, Y, indices)
+}
+
+func computeWeightedSumContiguousAVX512(W []float64, Y []float64) (sumW float64, sumWY float64) {
+	return computeWeightedSumContiguousScalar(W, Y)
+}
+
 func computeWeightedSumAVX2(W []float64, Y []float64, indices []int) (sumW float64, sumWY float64) {
 	return computeWeightedSumScalar(W, Y, indices)
 }
