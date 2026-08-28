@@ -32,6 +32,10 @@ jobs:
       - name: Verify Dependencies
         run: go mod verify
 
+      - name: Verify License Headers
+        if: runner.os == 'Linux'
+        run: make check-license
+
       - name: Run Go Vet
         run: go vet ./...
 
