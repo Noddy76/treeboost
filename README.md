@@ -109,9 +109,10 @@ cbTrees, cbBase := treeboost.TrainSymmetricGBDT(X, Y, W, treeboost.CatBoostParam
 lgbTrees, lgbBase := treeboost.TrainLeafwiseGBDT(X, Y, W, treeboost.LightGBMParams{
 	MaxDepth:        6,
 	MaxLeaves:       31,
-	MinChildSamples: 5,
+	MinChildSamples: 20,
 	Estimators:      200,
 	LearningRate:    0.05,
+	L2LeafReg:       1.0,
 })
 
 // ExtraTrees (Extremely Randomized Trees)
