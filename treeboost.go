@@ -187,6 +187,93 @@ func (m *Model) PredictBatch(features []float64, nSamples int) []float64 {
 	return results
 }
 
+// Standard 6 horizon bin names
+var DefaultHorizonBins = []string{"0-6h", "6-12h", "12-24h", "24-36h", "36-48h", ">48h"}
+
+// HorizonBinForLeadTime returns the 0-indexed bin (0 to 5) for a given lead time in hours.
+// Boundaries: [0, 6), [6, 12), [12, 24), [24, 36), [36, 48), [48, inf).
+func HorizonBinForLeadTime(leadHours float64) int {
+	switch {
+	case leadHours < 6:
+		return 0
+	case leadHours < 12:
+		return 1
+	case leadHours < 24:
+		return 2
+	case leadHours < 36:
+		return 3
+	case leadHours < 48:
+		return 4
+	default:
+		return 5
+	}
+}
+
+// PredictInterval evaluates the model and applies empirical horizon residual offsets,
+// returning (P10, P50, P90). Unconditionally guarantees P10 <= P50 <= P90 under all conditions
+// (including negative targets) by clamping raw offsets.
+func (m *Model) PredictInterval(features []float64, leadHours float64) (p10, p50, p90 float64) {
+	if m == nil {
+		return 0.0, 0.0, 0.0
+	}
+	p50 = m.Predict(features)
+	bin := HorizonBinForLeadTime(leadHours)
+
+	var off10, off90 float64
+	if len(m.P10Offsets) > 0 {
+		idx := bin
+		if idx >= len(m.P10Offsets) {
+			idx = len(m.P10Offsets) - 1
+		}
+		off10 = m.P10Offsets[idx]
+	}
+	if len(m.P90Offsets) > 0 {
+		idx := bin
+		if idx >= len(m.P90Offsets) {
+			idx = len(m.P90Offsets) - 1
+		}
+		off90 = m.P90Offsets[idx]
+	}
+
+	p10 = math.Min(p50+off10, p50)
+	p90 = math.Max(p50+off90, p50)
+	return p10, p50, p90
+}
+
+// PredictBatchInterval evaluates batch feature vectors with corresponding lead times.
+func (m *Model) PredictBatchInterval(flatFeatures []float64, leadHours []float64) (p10, p50, p90 []float64) {
+	nSamples := len(leadHours)
+	if m == nil || nSamples == 0 {
+		return nil, nil, nil
+	}
+	p50s := m.PredictBatch(flatFeatures, nSamples)
+	p10s := make([]float64, nSamples)
+	p90s := make([]float64, nSamples)
+
+	for i := 0; i < nSamples; i++ {
+		bin := HorizonBinForLeadTime(leadHours[i])
+		var off10, off90 float64
+		if len(m.P10Offsets) > 0 {
+			idx := bin
+			if idx >= len(m.P10Offsets) {
+				idx = len(m.P10Offsets) - 1
+			}
+			off10 = m.P10Offsets[idx]
+		}
+		if len(m.P90Offsets) > 0 {
+			idx := bin
+			if idx >= len(m.P90Offsets) {
+				idx = len(m.P90Offsets) - 1
+			}
+			off90 = m.P90Offsets[idx]
+		}
+
+		p10s[i] = math.Min(p50s[i]+off10, p50s[i])
+		p90s[i] = math.Max(p50s[i]+off90, p50s[i])
+	}
+	return p10s, p50s, p90s
+}
+
 // evaluateTreeFlat evaluates a tree for sampleIdx directly against flattened row-major features without allocations.
 func evaluateTreeFlat(nodes []Node, features []float64, nFeatures int, sampleIdx int) float64 {
 	if len(nodes) == 0 {
