@@ -926,7 +926,7 @@ func TestNonlinearFunctionApproximation(t *testing.T) {
 
 	for i := 0; i < nSamples; i++ {
 		x0 := (float64(i) / float64(nSamples)) * 4.0 * math.Pi // 0 to 4pi
-		x1 := float64(i%20) / 5.0                             // 0 to 4
+		x1 := float64(i%20) / 5.0                              // 0 to 4
 		X[i] = FeatureVector{Values: []float64{x0, x1}}
 		Y[i] = math.Sin(x0) + x1*x1
 	}

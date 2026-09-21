@@ -86,30 +86,6 @@ func DefaultEnsembleConfig() EnsembleConfig {
 	}
 }
 
-// ComputeSampleWeights calculates weights for observations using a log-distance from the target mean,
-// emphasizing and penalizing extreme spikes/troughs.
-func ComputeSampleWeights(Y []float64) []float64 {
-	if len(Y) == 0 {
-		return nil
-	}
-	var sum float64
-	for _, val := range Y {
-		sum += val
-	}
-	mean := sum / float64(len(Y))
-
-	weights := make([]float64, len(Y))
-	for i, y := range Y {
-		diff := math.Abs(y - mean)
-		w := 5.0*math.Log10(diff+10.0) - 4.0
-		weights[i] = math.Round(w)
-		if weights[i] < 1.0 {
-			weights[i] = 1.0
-		}
-	}
-	return weights
-}
-
 type nodeRange struct {
 	start int
 	end   int
@@ -529,7 +505,7 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 						continue
 					}
 
-					gain := (leftWY*leftWY/leftW + rightWY*rightWY/rightW) - (leaf.sumWY*leaf.sumWY/leaf.sumW)
+					gain := (leftWY*leftWY/leftW + rightWY*rightWY/rightW) - (leaf.sumWY * leaf.sumWY / leaf.sumW)
 
 					if gain > bestGain {
 						bestGain = gain
@@ -576,7 +552,7 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 							continue
 						}
 
-						gain := (sumWYLeft*sumWYLeft/sumWLeft + sumWYRight*sumWYRight/sumWRight) - (leaf.sumWY*leaf.sumWY/leaf.sumW)
+						gain := (sumWYLeft*sumWYLeft/sumWLeft + sumWYRight*sumWYRight/sumWRight) - (leaf.sumWY * leaf.sumWY / leaf.sumW)
 
 						if gain > bestGain {
 							bestGain = gain
@@ -921,9 +897,9 @@ func ScaleTreeLeavesInPlace(tree *Tree, factor float64) {
 	}
 }
 
-// TrainEnsemble trains a multi-algorithm tree ensemble combining CatBoost, LightGBM, and ExtraTrees models.
-func TrainEnsemble(X []FeatureVector, Y []float64, config EnsembleConfig) *Model {
-	W := ComputeSampleWeights(Y)
+// TrainEnsembleWithWeights trains a multi-algorithm tree ensemble (CatBoost, LightGBM, ExtraTrees)
+// using explicit sample weights W.
+func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, config EnsembleConfig) *Model {
 	data := ToColumnar(X, Y, W)
 
 	cbTrees, cbBase := TrainSymmetricGBDTColumnar(data, config.CatBoost)
@@ -962,4 +938,9 @@ func TrainEnsemble(X []FeatureVector, Y []float64, config EnsembleConfig) *Model
 	}
 	model.ComputeMetrics(X, Y)
 	return model
+}
+
+// TrainEnsemble trains a multi-algorithm tree ensemble combining CatBoost, LightGBM, and ExtraTrees models.
+func TrainEnsemble(X []FeatureVector, Y []float64, config EnsembleConfig) *Model {
+	return TrainEnsembleWithWeights(X, Y, ComputeSampleWeights(Y), config)
 }
