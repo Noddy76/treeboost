@@ -38,6 +38,7 @@ type LightGBMParams struct {
 	MinChildSamples int     `json:"min_child_samples"`
 	Estimators      int     `json:"estimators"`
 	LearningRate    float64 `json:"learning_rate"`
+	L2LeafReg       float64 `json:"l2_leaf_reg"` // L2 leaf regularization parameter (lambda >= 0.0)
 }
 
 // ExtraTreesParams holds hyperparameters for Extremely Randomized Trees.
@@ -74,9 +75,10 @@ func DefaultEnsembleConfig() EnsembleConfig {
 		LightGBM: LightGBMParams{
 			MaxDepth:        5,
 			MaxLeaves:       31,
-			MinChildSamples: 5,
+			MinChildSamples: 20,
 			Estimators:      500,
 			LearningRate:    0.05,
+			L2LeafReg:       1.0,
 		},
 		ExtraTrees: ExtraTreesParams{
 			Estimators:     700,
@@ -446,7 +448,7 @@ type lgbBuildNode struct {
 	sumWY        float64
 }
 
-func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int) []Node {
+func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64) []Node {
 	for i := 0; i < data.NumSamples; i++ {
 		ws.SampleIdxs[i] = i
 	}
@@ -460,8 +462,8 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 	}
 
 	meanRoot := 0.0
-	if sumW > 1e-9 {
-		meanRoot = sumWY / sumW
+	if sumW+lambda > 1e-9 {
+		meanRoot = sumWY / (sumW + lambda)
 	}
 
 	buildNodes := make([]lgbBuildNode, 0, maxLeaves*2+1)
@@ -505,15 +507,15 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 						continue
 					}
 
-					gain := (leftWY*leftWY/leftW + rightWY*rightWY/rightW) - (leaf.sumWY * leaf.sumWY / leaf.sumW)
+					gain := (leftWY*leftWY/(leftW+lambda) + rightWY*rightWY/(rightW+lambda)) - (leaf.sumWY * leaf.sumWY / (leaf.sumW + lambda))
 
 					if gain > bestGain {
 						bestGain = gain
 						bestActiveIdx = i
 						bestF = f
 						bestVal = val
-						bestLeftMean = leftWY / leftW
-						bestRightMean = rightWY / rightW
+						bestLeftMean = leftWY / (leftW + lambda)
+						bestRightMean = rightWY / (rightW + lambda)
 						bestLeftW = leftW
 						bestLeftWY = leftWY
 						bestRightW = rightW
@@ -552,15 +554,15 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 							continue
 						}
 
-						gain := (sumWYLeft*sumWYLeft/sumWLeft + sumWYRight*sumWYRight/sumWRight) - (leaf.sumWY * leaf.sumWY / leaf.sumW)
+						gain := (sumWYLeft*sumWYLeft/(sumWLeft+lambda) + sumWYRight*sumWYRight/(sumWRight+lambda)) - (leaf.sumWY * leaf.sumWY / (leaf.sumW + lambda))
 
 						if gain > bestGain {
 							bestGain = gain
 							bestActiveIdx = i
 							bestF = f
 							bestVal = val
-							bestLeftMean = sumWYLeft / sumWLeft
-							bestRightMean = sumWYRight / sumWRight
+							bestLeftMean = sumWYLeft / (sumWLeft + lambda)
+							bestRightMean = sumWYRight / (sumWRight + lambda)
 							bestLeftW = sumWLeft
 							bestLeftWY = sumWYLeft
 							bestRightW = sumWRight
@@ -637,9 +639,9 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 	return nodes
 }
 
-func trainLeafwiseTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, maxDepth int, maxLeaves int, minChildSamples int) []Node {
+func trainLeafwiseTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, maxDepth int, maxLeaves int, minChildSamples int, lambda float64) []Node {
 	data := ToColumnar(X, Y, W)
-	return trainLeafwiseTreeColumnar(ws, data, maxDepth, maxLeaves, minChildSamples)
+	return trainLeafwiseTreeColumnar(ws, data, maxDepth, maxLeaves, minChildSamples, lambda)
 }
 
 // TrainLeafwiseGBDTColumnar fits a leaf-wise GBDT on ColumnarDataset without per-iteration conversions.
@@ -672,7 +674,7 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 		}
 		iterData.Targets = residuals
 
-		treeNodes := trainLeafwiseTreeColumnar(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples)
+		treeNodes := trainLeafwiseTreeColumnar(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples, params.L2LeafReg)
 		trees = append(trees, Tree{Nodes: treeNodes})
 
 		for i := 0; i < n; i++ {

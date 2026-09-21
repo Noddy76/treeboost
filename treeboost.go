@@ -27,6 +27,8 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -190,6 +192,9 @@ func (m *Model) PredictBatch(features []float64, nSamples int) []float64 {
 // Standard 6 horizon bin names
 var DefaultHorizonBins = []string{"0-6h", "6-12h", "12-24h", "24-36h", "36-48h", ">48h"}
 
+// Extended 8 horizon bin names for medium-term / multi-week forecasts
+var ExtendedHorizonBins = []string{"0-6h", "6-12h", "12-24h", "24-36h", "36-48h", "48-96h", "96-168h", ">168h"}
+
 // HorizonBinForLeadTime returns the 0-indexed bin (0 to 5) for a given lead time in hours.
 // Boundaries: [0, 6), [6, 12), [12, 24), [24, 36), [36, 48), [48, inf).
 func HorizonBinForLeadTime(leadHours float64) int {
@@ -209,6 +214,56 @@ func HorizonBinForLeadTime(leadHours float64) int {
 	}
 }
 
+func parseBinUpperBound(bin string) (float64, error) {
+	bin = strings.TrimSpace(bin)
+	bin = strings.TrimSuffix(bin, "h")
+	if strings.HasPrefix(bin, ">") {
+		return math.Inf(1), nil
+	}
+	if idx := strings.Index(bin, "-"); idx >= 0 {
+		return strconv.ParseFloat(bin[idx+1:], 64)
+	}
+	return strconv.ParseFloat(bin, 64)
+}
+
+// HorizonBinForLeadTimeWithBins returns the 0-indexed bin for a given lead time in hours
+// according to the supplied slice of horizon bin names. If bins is nil or empty, DefaultHorizonBins is used.
+func HorizonBinForLeadTimeWithBins(leadHours float64, bins []string) int {
+	if len(bins) == 0 {
+		return HorizonBinForLeadTime(leadHours)
+	}
+	if len(bins) == 6 && bins[5] == ">48h" {
+		return HorizonBinForLeadTime(leadHours)
+	}
+	if len(bins) == 8 && bins[7] == ">168h" {
+		switch {
+		case leadHours < 6:
+			return 0
+		case leadHours < 12:
+			return 1
+		case leadHours < 24:
+			return 2
+		case leadHours < 36:
+			return 3
+		case leadHours < 48:
+			return 4
+		case leadHours < 96:
+			return 5
+		case leadHours < 168:
+			return 6
+		default:
+			return 7
+		}
+	}
+	for i := 0; i < len(bins)-1; i++ {
+		threshold, err := parseBinUpperBound(bins[i])
+		if err == nil && leadHours < threshold {
+			return i
+		}
+	}
+	return len(bins) - 1
+}
+
 // PredictInterval evaluates the model and applies empirical horizon residual offsets,
 // returning (P10, P50, P90). Unconditionally guarantees P10 <= P50 <= P90 under all conditions
 // (including negative targets) by clamping raw offsets.
@@ -217,7 +272,7 @@ func (m *Model) PredictInterval(features []float64, leadHours float64) (p10, p50
 		return 0.0, 0.0, 0.0
 	}
 	p50 = m.Predict(features)
-	bin := HorizonBinForLeadTime(leadHours)
+	bin := HorizonBinForLeadTimeWithBins(leadHours, m.HorizonBins)
 
 	var off10, off90 float64
 	if len(m.P10Offsets) > 0 {
@@ -251,7 +306,7 @@ func (m *Model) PredictBatchInterval(flatFeatures []float64, leadHours []float64
 	p90s := make([]float64, nSamples)
 
 	for i := 0; i < nSamples; i++ {
-		bin := HorizonBinForLeadTime(leadHours[i])
+		bin := HorizonBinForLeadTimeWithBins(leadHours[i], m.HorizonBins)
 		var off10, off90 float64
 		if len(m.P10Offsets) > 0 {
 			idx := bin

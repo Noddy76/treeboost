@@ -47,6 +47,73 @@ func TestHorizonBinForLeadTime(t *testing.T) {
 	}
 }
 
+func TestHorizonBinForLeadTimeWithBins(t *testing.T) {
+	// 1. Nil / empty should match HorizonBinForLeadTime
+	for _, h := range []float64{0.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0} {
+		if got := HorizonBinForLeadTimeWithBins(h, nil); got != HorizonBinForLeadTime(h) {
+			t.Errorf("HorizonBinForLeadTimeWithBins(nil) = %d, want %d", got, HorizonBinForLeadTime(h))
+		}
+		if got := HorizonBinForLeadTimeWithBins(h, []string{}); got != HorizonBinForLeadTime(h) {
+			t.Errorf("HorizonBinForLeadTimeWithBins(empty) = %d, want %d", got, HorizonBinForLeadTime(h))
+		}
+		if got := HorizonBinForLeadTimeWithBins(h, DefaultHorizonBins); got != HorizonBinForLeadTime(h) {
+			t.Errorf("HorizonBinForLeadTimeWithBins(DefaultHorizonBins) = %d, want %d", got, HorizonBinForLeadTime(h))
+		}
+	}
+
+	// 2. ExtendedHorizonBins (8 bins: 0-6h, 6-12h, 12-24h, 24-36h, 36-48h, 48-96h, 96-168h, >168h)
+	extendedCases := []struct {
+		leadHours float64
+		wantBin   int
+	}{
+		{0.0, 0},
+		{5.99, 0},
+		{6.0, 1},
+		{11.99, 1},
+		{12.0, 2},
+		{23.99, 2},
+		{24.0, 3},
+		{35.99, 3},
+		{36.0, 4},
+		{47.99, 4},
+		{48.0, 5},
+		{95.99, 5},
+		{96.0, 6},
+		{167.99, 6},
+		{168.0, 7},
+		{336.0, 7},
+	}
+
+	for _, tc := range extendedCases {
+		got := HorizonBinForLeadTimeWithBins(tc.leadHours, ExtendedHorizonBins)
+		if got != tc.wantBin {
+			t.Errorf("ExtendedHorizonBins(%f) = %d, want %d", tc.leadHours, got, tc.wantBin)
+		}
+	}
+
+	// 3. Custom bins
+	customBins := []string{"0-24h", "24-72h", ">72h"}
+	customCases := []struct {
+		leadHours float64
+		wantBin   int
+	}{
+		{0.0, 0},
+		{12.0, 0},
+		{23.99, 0},
+		{24.0, 1},
+		{50.0, 1},
+		{71.99, 1},
+		{72.0, 2},
+		{200.0, 2},
+	}
+	for _, tc := range customCases {
+		got := HorizonBinForLeadTimeWithBins(tc.leadHours, customBins)
+		if got != tc.wantBin {
+			t.Errorf("customBins(%f) = %d, want %d", tc.leadHours, got, tc.wantBin)
+		}
+	}
+}
+
 func TestModel_PredictInterval(t *testing.T) {
 	// Case 1: Positive prices with standard offsets
 	modelPos := &Model{
@@ -162,6 +229,39 @@ func TestModel_PredictBatchInterval(t *testing.T) {
 	p10Empty, p50Empty, p90Empty := model.PredictBatchInterval(nil, nil)
 	if p10Empty != nil || p50Empty != nil || p90Empty != nil {
 		t.Errorf("expected nil slices for empty batch")
+	}
+}
+
+func TestModel_PredictInterval_ExtendedHorizonBins(t *testing.T) {
+	model := &Model{
+		BaseValue:   100.0,
+		P10Offsets:  []float64{-5.0, -8.0, -12.0, -15.0, -18.0, -22.0, -28.0, -35.0},
+		P90Offsets:  []float64{6.0, 9.0, 14.0, 18.0, 21.0, 25.0, 32.0, 40.0},
+		HorizonBins: ExtendedHorizonBins,
+	}
+
+	// Lead time 100h should map to Bin 6 (96-168h): P10 offset -28.0, P90 offset 32.0
+	p10, p50, p90 := model.PredictInterval([]float64{1.0}, 100.0)
+	if math.Abs(p50-100.0) > 1e-9 {
+		t.Errorf("expected p50=100.0, got %f", p50)
+	}
+	if math.Abs(p10-72.0) > 1e-9 {
+		t.Errorf("expected p10=72.0, got %f", p10)
+	}
+	if math.Abs(p90-132.0) > 1e-9 {
+		t.Errorf("expected p90=132.0, got %f", p90)
+	}
+
+	// Lead time 200h should map to Bin 7 (>168h): P10 offset -35.0, P90 offset 40.0
+	p10L, p50L, p90L := model.PredictInterval([]float64{1.0}, 200.0)
+	if math.Abs(p50L-100.0) > 1e-9 {
+		t.Errorf("expected p50L=100.0, got %f", p50L)
+	}
+	if math.Abs(p10L-65.0) > 1e-9 {
+		t.Errorf("expected p10=65.0, got %f", p10L)
+	}
+	if math.Abs(p90L-140.0) > 1e-9 {
+		t.Errorf("expected p90=140.0, got %f", p90L)
 	}
 }
 
