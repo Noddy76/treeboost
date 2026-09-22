@@ -131,3 +131,85 @@ func TestLightGBM_BackwardCompatibility_L2LeafRegZero(t *testing.T) {
 		t.Errorf("expected positive base value, got %f", base)
 	}
 }
+
+func TestLightGBM_DiscreteFeatures_NoDivergence(t *testing.T) {
+	const nTrain = 200
+	const nHoldout = 50
+	const nTotal = nTrain + nHoldout
+
+	rng := rand.New(rand.NewSource(12345))
+
+	XAll := make([]FeatureVector, nTotal)
+	YAll := make([]float64, nTotal)
+	WAll := make([]float64, nTotal)
+
+	for i := 0; i < nTotal; i++ {
+		feat0 := float64(rng.Intn(2))                       // Binary flag [0.0, 1.0]
+		feat1 := float64(rng.Intn(7))                       // Day of week [0.0 ... 6.0]
+		feat2 := math.Cos(float64(i) * 2.0 * math.Pi / 7.0) // Bounded cosine [-1.0 ... 1.0]
+
+		XAll[i] = FeatureVector{Values: []float64{feat0, feat1, feat2}}
+		// Target: continuous value correlated with day of week
+		YAll[i] = 15.0 + 3.0*feat1 - 4.0*feat0 + 2.0*feat2 + rng.NormFloat64()*0.2
+		WAll[i] = 1.0
+	}
+
+	XTrain := XAll[:nTrain]
+	YTrain := YAll[:nTrain]
+	WTrain := WAll[:nTrain]
+
+	XHoldout := XAll[nTrain:]
+
+	params := LightGBMParams{
+		MaxDepth:        6,
+		MaxLeaves:       31,
+		MinChildSamples: 5,
+		Estimators:      200,
+		LearningRate:    0.05,
+		L2LeafReg:       0.0,
+	}
+
+	trees, baseVal := TrainLeafwiseGBDT(XTrain, YTrain, WTrain, params)
+	if len(trees) != params.Estimators {
+		t.Fatalf("expected %d trees, got %d", params.Estimators, len(trees))
+	}
+
+	// 1. Every tree in the ensemble is valid: no node has SplitFeature != -1 with LeftChild == -1 || RightChild == -1.
+	// 2. All leaf values remain strictly bounded (|LeafValue| < 1000.0).
+	for tIdx, tree := range trees {
+		for _, node := range tree.Nodes {
+			if node.SplitFeature != -1 {
+				if node.LeftChild == -1 || node.RightChild == -1 {
+					t.Fatalf("tree %d node %d has SplitFeature=%d but corrupted children (leftChild=%d, rightChild=%d)",
+						tIdx, node.NodeID, node.SplitFeature, node.LeftChild, node.RightChild)
+				}
+			} else {
+				if math.IsNaN(node.LeafValue) || math.IsInf(node.LeafValue, 0) {
+					t.Fatalf("tree %d node %d has non-finite leaf value: %f", tIdx, node.NodeID, node.LeafValue)
+				}
+				if math.Abs(node.LeafValue) >= 1000.0 {
+					t.Errorf("tree %d node %d leaf value exploded: %f", tIdx, node.NodeID, node.LeafValue)
+				}
+			}
+		}
+	}
+
+	// 3. Predictions on training and holdout samples do not contain NaN, Inf, or exploding values.
+	checkPredictions := func(name string, samples []FeatureVector) {
+		for i, fv := range samples {
+			pred := baseVal
+			for _, tree := range trees {
+				pred += params.LearningRate * EvaluateTree(tree.Nodes, fv)
+			}
+			if math.IsNaN(pred) || math.IsInf(pred, 0) {
+				t.Fatalf("%s prediction %d is non-finite: %f", name, i, pred)
+			}
+			if math.Abs(pred) > 1000.0 {
+				t.Errorf("%s prediction %d exploded: %f", name, i, pred)
+			}
+		}
+	}
+
+	checkPredictions("training", XTrain)
+	checkPredictions("holdout", XHoldout)
+}

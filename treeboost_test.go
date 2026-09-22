@@ -1098,3 +1098,43 @@ func TestFullEnsembleSerializationRoundtrip(t *testing.T) {
 		t.Errorf("Loaded model prediction (%f) does not match original (%f)", predLoaded, predOriginal)
 	}
 }
+
+func TestHistogramSplit_Midpoint(t *testing.T) {
+	boundaries := []float64{0.0, 10.0, 20.0, 30.0}
+	numBins := len(boundaries)
+
+	var hist FeatureHistogram
+
+	// Bin 0 has Y = 0.0, Bins 1..3 have Y = 10.0
+	hist.Count[0] = 5
+	hist.SumW[0] = 5.0
+	hist.SumWY[0] = 0.0
+
+	for b := 1; b < numBins; b++ {
+		hist.Count[b] = 5
+		hist.SumW[b] = 5.0
+		hist.SumWY[b] = 50.0
+	}
+
+	totalW := 20.0
+	totalWY := 150.0
+
+	// Test FindBestHistogramSplit returns arithmetic midpoint of adjacent boundaries
+	splitVal, _, found := FindBestHistogramSplit(&hist, boundaries, totalW, totalWY)
+	if !found {
+		t.Fatalf("expected FindBestHistogramSplit to find a split")
+	}
+	expectedSplit := (boundaries[0] + boundaries[1]) / 2.0 // (0.0 + 10.0) / 2.0 = 5.0
+	if math.Abs(splitVal-expectedSplit) > 1e-9 {
+		t.Errorf("FindBestHistogramSplit: expected midpoint %f, got %f", expectedSplit, splitVal)
+	}
+
+	// Test FindBestHistogramSplitWithCounts returns arithmetic midpoint of adjacent boundaries
+	splitValC, _, _, _, _, _, foundC := FindBestHistogramSplitWithCounts(&hist, boundaries, totalW, totalWY, 20, 1)
+	if !foundC {
+		t.Fatalf("expected FindBestHistogramSplitWithCounts to find a split")
+	}
+	if math.Abs(splitValC-expectedSplit) > 1e-9 {
+		t.Errorf("FindBestHistogramSplitWithCounts: expected midpoint %f, got %f", expectedSplit, splitValC)
+	}
+}

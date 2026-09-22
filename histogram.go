@@ -169,7 +169,11 @@ func FindBestHistogramSplit(hist *FeatureHistogram, boundaries []float64, totalW
 
 		if score < bestScore {
 			bestScore = score
-			bestSplitVal = boundaries[b]
+			if b+1 < numBins {
+				bestSplitVal = (boundaries[b] + boundaries[b+1]) / 2.0
+			} else {
+				bestSplitVal = boundaries[b]
+			}
 			found = true
 		}
 	}
@@ -211,7 +215,11 @@ func FindBestHistogramSplitWithCounts(hist *FeatureHistogram, boundaries []float
 
 		if scoreVal < bestScore {
 			bestScore = scoreVal
-			bestSplitVal = boundaries[b]
+			if b+1 < numBins {
+				bestSplitVal = (boundaries[b] + boundaries[b+1]) / 2.0
+			} else {
+				bestSplitVal = boundaries[b]
+			}
 			bestLeftW = curLeftW
 			bestLeftWY = curLeftWY
 			bestRightW = curRightW
