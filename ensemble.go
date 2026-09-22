@@ -579,13 +579,17 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 
 		parentIdx := activeLeaves[bestActiveIdx]
 		parent := &buildNodes[parentIdx]
-		parent.splitFeature = bestF
-		parent.splitValue = bestVal
 
 		mid := partitionSamplesInPlace(ws.SampleIdxs, parent.start, parent.end, data.Features, bestF*data.NumSamples, bestVal)
 		if mid == parent.start || mid == parent.end {
-			break
+			// Partitioning could not divide samples (e.g. constant feature values).
+			// Do not corrupt parent node; keep it as a leaf and remove from active list.
+			activeLeaves = append(activeLeaves[:bestActiveIdx], activeLeaves[bestActiveIdx+1:]...)
+			continue
 		}
+
+		parent.splitFeature = bestF
+		parent.splitValue = bestVal
 
 		leftNodeID := len(buildNodes)
 		rightNodeID := len(buildNodes) + 1
