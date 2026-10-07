@@ -44,22 +44,57 @@ func ComputeSampleWeightsWithConfig(Y []float64, cfg WeightConfig) []float64 {
 	if len(Y) == 0 {
 		return nil
 	}
-	var sum float64
-	for _, val := range Y {
-		sum += val
+	if cfg.MinWeight <= 0.0 || math.IsNaN(cfg.MinWeight) || math.IsInf(cfg.MinWeight, 0) {
+		cfg.MinWeight = 1.0
 	}
-	mean := sum / float64(len(Y))
+	if cfg.Offset <= 0.0 || math.IsNaN(cfg.Offset) || math.IsInf(cfg.Offset, 0) {
+		cfg.Offset = 10.0
+	}
+	if math.IsNaN(cfg.Multiplier) || math.IsInf(cfg.Multiplier, 0) {
+		cfg.Multiplier = 5.0
+	}
+	if math.IsNaN(cfg.Subtrahend) || math.IsInf(cfg.Subtrahend, 0) {
+		cfg.Subtrahend = 4.0
+	}
+	if cfg.NegativeMultiplier <= 0.0 || math.IsNaN(cfg.NegativeMultiplier) || math.IsInf(cfg.NegativeMultiplier, 0) {
+		cfg.NegativeMultiplier = 1.0
+	}
+
+	var sum float64
+	var finiteCount int
+	for _, val := range Y {
+		if !math.IsNaN(val) && !math.IsInf(val, 0) {
+			sum += val
+			finiteCount++
+		}
+	}
+	mean := 0.0
+	if finiteCount > 0 {
+		mean = sum / float64(finiteCount)
+	}
 
 	weights := make([]float64, len(Y))
 	for i, y := range Y {
+		if math.IsNaN(y) || math.IsInf(y, 0) {
+			weights[i] = cfg.MinWeight
+			continue
+		}
 		diff := math.Abs(y - mean)
-		w := cfg.Multiplier*math.Log10(diff+cfg.Offset) - cfg.Subtrahend
+		arg := diff + cfg.Offset
+		if arg <= 0.0 || math.IsNaN(arg) || math.IsInf(arg, 0) {
+			weights[i] = cfg.MinWeight
+			continue
+		}
+		w := cfg.Multiplier*math.Log10(arg) - cfg.Subtrahend
 		w = math.Round(w)
-		if w < cfg.MinWeight {
+		if math.IsNaN(w) || math.IsInf(w, 0) || w < cfg.MinWeight {
 			w = cfg.MinWeight
 		}
 		if y < 0 {
 			w *= cfg.NegativeMultiplier
+		}
+		if math.IsNaN(w) || math.IsInf(w, 0) || w < cfg.MinWeight {
+			w = cfg.MinWeight
 		}
 		weights[i] = w
 	}

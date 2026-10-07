@@ -26,3 +26,10 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Local Agent & Task Files
+.agents/
+ORIGINAL_REQUEST.md
+ISSUE_FIX.md
+PROMPT.md
+TASK.md

@@ -1,4 +1,6 @@
-.PHONY: all test test-race bench generate vet check-license clean
+.PHONY: all test test-race bench generate vet check-license clean fuzz
+
+FUZZTIME ?= 5s
 
 all: check-license vet test
 
@@ -25,6 +27,19 @@ test-race:
 
 bench:
 	go test -v -bench=. -benchmem ./...
+
+fuzz:
+	@echo "Running fuzz tests (fuzztime=$(FUZZTIME))..."
+	go test -fuzz=FuzzFindBestHistogramSplit -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzHistogramPartitionParity -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzQuantizeDataset_SpecialFloats -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzEvaluateTree -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzModelDeserializationAndEvaluation -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzTrainEnsembleWithWeights -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzChronologicalCVWithOptions -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzComputeSampleWeights -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzHorizonBinAndIntervalPrediction -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzSIMDWeightedSumParity -fuzztime=$(FUZZTIME) .
 
 generate:
 	go generate ./...

@@ -32,8 +32,24 @@ func computeWeightedSumScalar(W []float64, Y []float64, indices []int) (float64,
 }
 
 func computeWeightedSum(W []float64, Y []float64, indices []int) (float64, float64) {
+	if len(W) == 0 || len(Y) == 0 || len(indices) == 0 {
+		return 0.0, 0.0
+	}
 	if hasAVX2 && len(indices) >= 16 && len(indices) <= 2048 {
-		return computeWeightedSumAVX2(W, Y, indices)
+		maxIdx := len(W)
+		if len(Y) < maxIdx {
+			maxIdx = len(Y)
+		}
+		inBounds := true
+		for _, idx := range indices {
+			if idx < 0 || idx >= maxIdx {
+				inBounds = false
+				break
+			}
+		}
+		if inBounds {
+			return computeWeightedSumAVX2(W, Y, indices)
+		}
 	}
 	return computeWeightedSumScalar(W, Y, indices)
 }

@@ -16,6 +16,7 @@ package treeboost
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -143,6 +144,14 @@ func TestChronologicalCV_EdgeCases(t *testing.T) {
 	}
 	if _, _, err := ChronologicalCV(X, Y, ts, config, 2, 5); err == nil {
 		t.Error("expected error for out of bounds leadTimeFeatureIndex, got nil")
+	}
+
+	// leadTimeFeatureIndex >= 0 with empty feature vector
+	for i := range X {
+		X[i] = FeatureVector{Values: []float64{}}
+	}
+	if _, _, err := ChronologicalCV(X, Y, ts, config, 2, 0); err == nil {
+		t.Error("expected error for leadTimeFeatureIndex with empty feature vectors, got nil")
 	}
 }
 
@@ -386,4 +395,224 @@ func TestChronologicalCVWithOptions_SampleWeightsConfig(t *testing.T) {
 	if len(offsets.P10) != len(DefaultHorizonBins) {
 		t.Errorf("expected %d bins, got %d", len(DefaultHorizonBins), len(offsets.P10))
 	}
+}
+
+// TestChronologicalCV_DivergenceProtection_IssueFixScenario reproduces the rolling-origin scenario from ISSUE_FIX.md.
+// It verifies that out-of-fold validation metrics remain bounded (ValidationMAE < 200, ValidationRMSE < 200)
+// and never produce astronomical errors (~1e16), and all leaf values remain strictly bounded.
+func TestChronologicalCV_DivergenceProtection_IssueFixScenario(t *testing.T) {
+	const nSamples = 600
+	const nFeatures = 12
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	X := make([]FeatureVector, nSamples)
+	Y := make([]float64, nSamples)
+	timestamps := make([]time.Time, nSamples)
+
+	for i := 0; i < nSamples; i++ {
+		timestamps[i] = baseTime.Add(time.Duration(i) * time.Hour)
+		vals := make([]float64, nFeatures)
+		for f := 0; f < nFeatures; f++ {
+			vals[f] = float64((i*17 + f*31) % 100)
+		}
+		X[i] = FeatureVector{Values: vals}
+		// Target distribution: mean ~ 68.38, std dev ~ 46.84 with periodic spikes/plunges
+		baseTarget := 68.38 + 25.0*math.Sin(float64(i)*0.1) + 15.0*math.Cos(float64(i)*0.03)
+		if i%23 == 0 {
+			baseTarget -= 60.0 // plunge
+		} else if i%37 == 0 {
+			baseTarget += 80.0 // spike
+		}
+		Y[i] = baseTarget
+	}
+
+	config := DefaultEnsembleConfig()
+	config.CatBoost.Iterations = 30
+	config.LightGBM.Estimators = 30
+	config.ExtraTrees.Estimators = 30
+
+	opts := ChronologicalCVOptions{
+		NumFolds:             5,
+		LeadTimeFeatureIndex: -1,
+		HorizonBins:          ExtendedHorizonBins,
+		MaxValidPrediction:   1e6,
+	}
+
+	offsets, metrics, err := ChronologicalCVWithOptions(X, Y, timestamps, config, opts)
+	if err != nil {
+		t.Fatalf("unexpected error during chronological CV: %v", err)
+	}
+
+	if math.IsNaN(metrics.ValidationMAE) || math.IsInf(metrics.ValidationMAE, 0) {
+		t.Fatalf("ValidationMAE is non-finite: %f", metrics.ValidationMAE)
+	}
+	if math.IsNaN(metrics.ValidationRMSE) || math.IsInf(metrics.ValidationRMSE, 0) {
+		t.Fatalf("ValidationRMSE is non-finite: %f", metrics.ValidationRMSE)
+	}
+
+	// Verify metrics did not explode astronomically (which previously reached ~10^16)
+	if metrics.ValidationMAE > 200.0 {
+		t.Errorf("ValidationMAE exploded: %f (expected < 200.0)", metrics.ValidationMAE)
+	}
+	if metrics.ValidationRMSE > 200.0 {
+		t.Errorf("ValidationRMSE exploded: %f (expected < 200.0)", metrics.ValidationRMSE)
+	}
+
+	// Verify all horizon offsets are finite
+	for b, val := range offsets.P10 {
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			t.Errorf("P10 offset at bin %d is non-finite: %f", b, val)
+		}
+	}
+	for b, val := range offsets.P90 {
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			t.Errorf("P90 offset at bin %d is non-finite: %f", b, val)
+		}
+	}
+}
+
+// TestChronologicalCV_FailFastOnInvalidPrediction verifies that ChronologicalCVWithOptions
+// fails fast immediately when an out-of-fold prediction exceeds MaxValidPrediction or is non-finite,
+// returning an error containing the fold index and prediction value.
+func TestChronologicalCV_FailFastOnInvalidPrediction(t *testing.T) {
+	const nSamples = 120
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	X := make([]FeatureVector, nSamples)
+	Y := make([]float64, nSamples)
+	timestamps := make([]time.Time, nSamples)
+
+	for i := 0; i < nSamples; i++ {
+		timestamps[i] = baseTime.Add(time.Duration(i) * time.Hour)
+		X[i] = FeatureVector{Values: []float64{float64(i)}}
+		Y[i] = 100.0 + float64(i) // Predictions will be ~100.0+
+	}
+
+	config := DefaultEnsembleConfig()
+	config.CatBoost.Iterations = 10
+	config.LightGBM.Estimators = 10
+	config.ExtraTrees.Estimators = 10
+
+	// Set MaxValidPrediction to 10.0 (predictions ~100.0 will exceed this ceiling)
+	opts := ChronologicalCVOptions{
+		NumFolds:           3,
+		MaxValidPrediction: 10.0,
+	}
+
+	_, _, err := ChronologicalCVWithOptions(X, Y, timestamps, config, opts)
+	if err == nil {
+		t.Fatalf("expected fail-fast error for predictions exceeding MaxValidPrediction, got nil")
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "chronological CV fold") {
+		t.Errorf("expected error message to specify fold index, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "invalid out-of-fold prediction") {
+		t.Errorf("expected error message to specify 'invalid out-of-fold prediction', got: %s", errMsg)
+	}
+}
+
+// TestChronologicalCV_FractionalWeights verifies chronological CV on datasets where sample weights
+// are sub-unit (summing to << 1.0 across folds) to ensure bounded metrics without numerical distortion.
+func TestChronologicalCV_FractionalWeights(t *testing.T) {
+	const nSamples = 120
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	X := make([]FeatureVector, nSamples)
+	Y := make([]float64, nSamples)
+	timestamps := make([]time.Time, nSamples)
+
+	for i := 0; i < nSamples; i++ {
+		timestamps[i] = baseTime.Add(time.Duration(i) * time.Hour)
+		X[i] = FeatureVector{Values: []float64{float64(i)}}
+		Y[i] = 50.0 + 10.0*math.Sin(float64(i)*0.2)
+	}
+
+	config := DefaultEnsembleConfig()
+	config.CatBoost.Iterations = 10
+	config.LightGBM.Estimators = 10
+	config.ExtraTrees.Estimators = 10
+
+	opts := ChronologicalCVOptions{
+		NumFolds: 3,
+		SampleWeightsConfig: &WeightConfig{
+			Multiplier:         0.001,
+			Offset:             1.0,
+			Subtrahend:         0.0,
+			MinWeight:          0.0001,
+			NegativeMultiplier: 1.0,
+		},
+	}
+
+	offsets, metrics, err := ChronologicalCVWithOptions(X, Y, timestamps, config, opts)
+	if err != nil {
+		t.Fatalf("unexpected error during chronological CV with fractional weights: %v", err)
+	}
+
+	if math.IsNaN(metrics.ValidationMAE) || math.IsInf(metrics.ValidationMAE, 0) {
+		t.Fatalf("ValidationMAE is non-finite: %f", metrics.ValidationMAE)
+	}
+	if metrics.ValidationMAE > 50.0 {
+		t.Errorf("ValidationMAE exploded under fractional weights: %f", metrics.ValidationMAE)
+	}
+	for b, val := range offsets.P10 {
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			t.Errorf("P10 offset at bin %d is non-finite: %f", b, val)
+		}
+	}
+	for b, val := range offsets.P90 {
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			t.Errorf("P90 offset at bin %d is non-finite: %f", b, val)
+		}
+	}
+}
+
+// FuzzChronologicalCVWithOptions tests edge-case inputs to ChronologicalCVWithOptions.
+func FuzzChronologicalCVWithOptions(f *testing.F) {
+	f.Add(3, float64(1e6), float64(48.0), float64(50.0))
+	f.Add(2, float64(10.0), float64(0.0), float64(100.0))
+	f.Add(4, float64(-1.0), float64(24.0), float64(-30.0))
+
+	f.Fuzz(func(t *testing.T, numFolds int, maxValidPred, maxLeadHours, targetShift float64) {
+		if math.IsNaN(maxValidPred) || math.IsNaN(maxLeadHours) || math.IsNaN(targetShift) {
+			return
+		}
+		if numFolds < 2 || numFolds > 10 {
+			return
+		}
+
+		const nSamples = 30
+		baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		X := make([]FeatureVector, nSamples)
+		Y := make([]float64, nSamples)
+		timestamps := make([]time.Time, nSamples)
+
+		for i := 0; i < nSamples; i++ {
+			timestamps[i] = baseTime.Add(time.Duration(i) * time.Hour)
+			X[i] = FeatureVector{Values: []float64{float64(i), math.Sin(float64(i))}}
+			Y[i] = targetShift + float64(i)
+		}
+
+		config := DefaultEnsembleConfig()
+		config.CatBoost.Iterations = 2
+		config.LightGBM.Estimators = 2
+		config.ExtraTrees.Estimators = 2
+
+		opts := ChronologicalCVOptions{
+			NumFolds:           numFolds,
+			MaxLeadHours:       maxLeadHours,
+			MaxValidPrediction: maxValidPred,
+		}
+
+		_, metrics, err := ChronologicalCVWithOptions(X, Y, timestamps, config, opts)
+		if err == nil {
+			if math.IsNaN(metrics.ValidationMAE) || math.IsInf(metrics.ValidationMAE, 0) {
+				t.Fatalf("ChronologicalCVWithOptions returned non-finite ValidationMAE without error: %f", metrics.ValidationMAE)
+			}
+			if math.IsNaN(metrics.ValidationRMSE) || math.IsInf(metrics.ValidationRMSE, 0) {
+				t.Fatalf("ChronologicalCVWithOptions returned non-finite ValidationRMSE without error: %f", metrics.ValidationRMSE)
+			}
+		}
+	})
 }

@@ -16,6 +16,7 @@ package treeboost
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -322,4 +323,51 @@ func TestTrainEnsembleWithWeights(t *testing.T) {
 	if mDefault == nil || len(mDefault.Trees) == 0 {
 		t.Fatal("TrainEnsemble returned invalid model")
 	}
+}
+
+// FuzzHorizonBinAndIntervalPrediction tests horizon bin resolution and interval predictions
+// guaranteeing P10 <= P50 <= P90 under all adversarial inputs.
+func FuzzHorizonBinAndIntervalPrediction(f *testing.F) {
+	f.Add(float64(12.5), float64(50.0), float64(-10.0), float64(15.0), "0-6h,6-12h,12-24h,>24h")
+	f.Add(float64(-5.0), float64(100.0), float64(-50.0), float64(50.0), "")
+	f.Add(float64(1e6), float64(-200.0), float64(10.0), float64(-10.0), "invalid,0-0h,>100h")
+	f.Add(float64(0.0), float64(0.0), float64(0.0), float64(0.0), ">48h")
+
+	f.Fuzz(func(t *testing.T, leadHours, baseVal, off10, off90 float64, customBinsStr string) {
+		var bins []string
+		if len(customBinsStr) > 0 {
+			bins = strings.Split(customBinsStr, ",")
+		}
+
+		bin := HorizonBinForLeadTimeWithBins(leadHours, bins)
+		if bin < 0 {
+			t.Fatalf("HorizonBinForLeadTimeWithBins returned negative bin: %d", bin)
+		}
+		if len(bins) > 0 && bin >= len(bins) {
+			t.Fatalf("HorizonBinForLeadTimeWithBins returned out-of-bounds bin %d (len %d)", bin, len(bins))
+		}
+
+		m := &Model{
+			BaseValue:   baseVal,
+			HorizonBins: bins,
+			P10Offsets:  []float64{off10},
+			P90Offsets:  []float64{off90},
+		}
+
+		p10, p50, p90 := m.PredictInterval([]float64{1.0, 2.0}, leadHours)
+
+		if math.IsNaN(p10) || math.IsNaN(p50) || math.IsNaN(p90) {
+			t.Fatalf("PredictInterval returned NaN: p10=%f, p50=%f, p90=%f", p10, p50, p90)
+		}
+		if math.IsInf(p10, 0) || math.IsInf(p50, 0) || math.IsInf(p90, 0) {
+			t.Fatalf("PredictInterval returned Inf: p10=%f, p50=%f, p90=%f", p10, p50, p90)
+		}
+
+		if p10 > p50 {
+			t.Fatalf("invariant broken: P10 (%f) > P50 (%f)", p10, p50)
+		}
+		if p50 > p90 {
+			t.Fatalf("invariant broken: P50 (%f) > P90 (%f)", p50, p90)
+		}
+	})
 }

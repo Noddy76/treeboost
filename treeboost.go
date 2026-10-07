@@ -25,6 +25,8 @@ package treeboost
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"os"
 	"strconv"
@@ -150,7 +152,10 @@ func (m *Model) ComputeMetrics(X []FeatureVector, Y []float64) {
 // (where sample i feature f is at index i*nFeatures + f).
 // Returns a slice of predicted values of length nSamples.
 func (m *Model) PredictBatch(features []float64, nSamples int) []float64 {
-	if m == nil || nSamples <= 0 || len(features) == 0 {
+	if nSamples <= 0 {
+		return nil
+	}
+	if m == nil || len(features) == 0 {
 		return make([]float64, nSamples)
 	}
 	nFeatures := len(features) / nSamples
@@ -229,6 +234,9 @@ func parseBinUpperBound(bin string) (float64, error) {
 // HorizonBinForLeadTimeWithBins returns the 0-indexed bin for a given lead time in hours
 // according to the supplied slice of horizon bin names. If bins is nil or empty, DefaultHorizonBins is used.
 func HorizonBinForLeadTimeWithBins(leadHours float64, bins []string) int {
+	if math.IsNaN(leadHours) || leadHours <= 0 {
+		return 0
+	}
 	if len(bins) == 0 {
 		return HorizonBinForLeadTime(leadHours)
 	}
@@ -272,6 +280,9 @@ func (m *Model) PredictInterval(features []float64, leadHours float64) (p10, p50
 		return 0.0, 0.0, 0.0
 	}
 	p50 = m.Predict(features)
+	if math.IsNaN(p50) || math.IsInf(p50, 0) {
+		p50 = 0.0
+	}
 	bin := HorizonBinForLeadTimeWithBins(leadHours, m.HorizonBins)
 
 	var off10, off90 float64
@@ -290,6 +301,13 @@ func (m *Model) PredictInterval(features []float64, leadHours float64) (p10, p50
 		off90 = m.P90Offsets[idx]
 	}
 
+	if math.IsNaN(off10) || math.IsInf(off10, 0) {
+		off10 = 0.0
+	}
+	if math.IsNaN(off90) || math.IsInf(off90, 0) {
+		off90 = 0.0
+	}
+
 	p10 = math.Min(p50+off10, p50)
 	p90 = math.Max(p50+off90, p50)
 	return p10, p50, p90
@@ -306,6 +324,9 @@ func (m *Model) PredictBatchInterval(flatFeatures []float64, leadHours []float64
 	p90s := make([]float64, nSamples)
 
 	for i := 0; i < nSamples; i++ {
+		if math.IsNaN(p50s[i]) || math.IsInf(p50s[i], 0) {
+			p50s[i] = 0.0
+		}
 		bin := HorizonBinForLeadTimeWithBins(leadHours[i], m.HorizonBins)
 		var off10, off90 float64
 		if len(m.P10Offsets) > 0 {
@@ -323,6 +344,13 @@ func (m *Model) PredictBatchInterval(flatFeatures []float64, leadHours []float64
 			off90 = m.P90Offsets[idx]
 		}
 
+		if math.IsNaN(off10) || math.IsInf(off10, 0) {
+			off10 = 0.0
+		}
+		if math.IsNaN(off90) || math.IsInf(off90, 0) {
+			off90 = 0.0
+		}
+
 		p10s[i] = math.Min(p50s[i]+off10, p50s[i])
 		p90s[i] = math.Max(p50s[i]+off90, p50s[i])
 	}
@@ -331,12 +359,12 @@ func (m *Model) PredictBatchInterval(flatFeatures []float64, leadHours []float64
 
 // evaluateTreeFlat evaluates a tree for sampleIdx directly against flattened row-major features without allocations.
 func evaluateTreeFlat(nodes []Node, features []float64, nFeatures int, sampleIdx int) float64 {
-	if len(nodes) == 0 {
+	if len(nodes) == 0 || sampleIdx < 0 || nFeatures <= 0 {
 		return 0.0
 	}
 	baseOffset := sampleIdx * nFeatures
 	curr := 0
-	for {
+	for steps := 0; steps < len(nodes); steps++ {
 		if curr < 0 || curr >= len(nodes) {
 			return 0.0
 		}
@@ -345,8 +373,9 @@ func evaluateTreeFlat(nodes []Node, features []float64, nFeatures int, sampleIdx
 			return node.LeafValue
 		}
 		var fVal float64
-		if node.SplitFeature >= 0 && node.SplitFeature < nFeatures {
-			fVal = features[baseOffset+node.SplitFeature]
+		idx := baseOffset + node.SplitFeature
+		if node.SplitFeature >= 0 && node.SplitFeature < nFeatures && idx >= 0 && idx < len(features) {
+			fVal = features[idx]
 		}
 		if fVal < node.SplitValue {
 			curr = node.LeftChild
@@ -354,6 +383,7 @@ func evaluateTreeFlat(nodes []Node, features []float64, nFeatures int, sampleIdx
 			curr = node.RightChild
 		}
 	}
+	return 0.0
 }
 
 // FeatureVector represents an n-dimensional sample observation vector of floating-point features.
@@ -413,7 +443,7 @@ func EvaluateTree(nodes []Node, x FeatureVector) float64 {
 		return 0.0
 	}
 	curr := 0
-	for {
+	for steps := 0; steps < len(nodes); steps++ {
 		if curr < 0 || curr >= len(nodes) {
 			return 0.0
 		}
@@ -431,15 +461,16 @@ func EvaluateTree(nodes []Node, x FeatureVector) float64 {
 			curr = node.RightChild
 		}
 	}
+	return 0.0
 }
 
 // EvaluateTreeColumnar evaluates a tree on sampleIdx within ColumnarDataset without allocations.
 func EvaluateTreeColumnar(nodes []Node, data ColumnarDataset, sampleIdx int) float64 {
-	if len(nodes) == 0 {
+	if len(nodes) == 0 || sampleIdx < 0 || sampleIdx >= data.NumSamples {
 		return 0.0
 	}
 	curr := 0
-	for {
+	for steps := 0; steps < len(nodes); steps++ {
 		if curr < 0 || curr >= len(nodes) {
 			return 0.0
 		}
@@ -448,8 +479,9 @@ func EvaluateTreeColumnar(nodes []Node, data ColumnarDataset, sampleIdx int) flo
 			return node.LeafValue
 		}
 		var fVal float64
-		if node.SplitFeature >= 0 && node.SplitFeature < data.NumFeatures {
-			fVal = data.Features[node.SplitFeature*data.NumSamples+sampleIdx]
+		idx := node.SplitFeature*data.NumSamples + sampleIdx
+		if node.SplitFeature >= 0 && node.SplitFeature < data.NumFeatures && idx >= 0 && idx < len(data.Features) {
+			fVal = data.Features[idx]
 		}
 		if fVal < node.SplitValue {
 			curr = node.LeftChild
@@ -457,6 +489,7 @@ func EvaluateTreeColumnar(nodes []Node, data ColumnarDataset, sampleIdx int) flo
 			curr = node.RightChild
 		}
 	}
+	return 0.0
 }
 
 // ScaleTreeLeaves returns a deep copy of tree with all leaf node values multiplied by factor.
@@ -471,7 +504,64 @@ func ScaleTreeLeaves(tree Tree, factor float64) Tree {
 	return Tree{Nodes: nodes}
 }
 
-// LoadModel loads a serialized GBDT model from a JSON file.
+// Validate checks model invariants: finite BaseValue, valid LearningRate, and structural integrity of all trees.
+func (m *Model) Validate() error {
+	if m == nil {
+		return errors.New("model is nil")
+	}
+	if math.IsNaN(m.BaseValue) || math.IsInf(m.BaseValue, 0) {
+		return errors.New("model BaseValue is non-finite")
+	}
+	if math.IsNaN(m.LearningRate) || math.IsInf(m.LearningRate, 0) {
+		return errors.New("model LearningRate is non-finite")
+	}
+	for tIdx, tree := range m.Trees {
+		numNodes := len(tree.Nodes)
+		if numNodes == 0 {
+			continue
+		}
+		visited := make([]bool, numNodes)
+		var checkNode func(idx, depth int) error
+		checkNode = func(idx, depth int) error {
+			if idx < 0 || idx >= numNodes {
+				return fmt.Errorf("tree %d node index %d out of bounds [0, %d)", tIdx, idx, numNodes)
+			}
+			if depth > numNodes || depth > 128 {
+				return fmt.Errorf("tree %d has cycle or depth exceeding limit at node %d", tIdx, idx)
+			}
+			if visited[idx] {
+				return fmt.Errorf("tree %d contains cycle at node %d", tIdx, idx)
+			}
+			visited[idx] = true
+			node := tree.Nodes[idx]
+			if node.SplitFeature == -1 {
+				if math.IsNaN(node.LeafValue) || math.IsInf(node.LeafValue, 0) {
+					return fmt.Errorf("tree %d leaf node %d has non-finite LeafValue: %v", tIdx, idx, node.LeafValue)
+				}
+				return nil
+			}
+			if node.LeftChild < 0 || node.LeftChild >= numNodes {
+				return fmt.Errorf("tree %d internal node %d has invalid LeftChild %d", tIdx, idx, node.LeftChild)
+			}
+			if node.RightChild < 0 || node.RightChild >= numNodes {
+				return fmt.Errorf("tree %d internal node %d has invalid RightChild %d", tIdx, idx, node.RightChild)
+			}
+			if math.IsNaN(node.SplitValue) || math.IsInf(node.SplitValue, 0) {
+				return fmt.Errorf("tree %d internal node %d has non-finite SplitValue", tIdx, idx)
+			}
+			if err := checkNode(node.LeftChild, depth+1); err != nil {
+				return err
+			}
+			return checkNode(node.RightChild, depth+1)
+		}
+		if err := checkNode(0, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LoadModel loads a serialized GBDT model from a JSON file and validates its integrity.
 func LoadModel(path string) (*Model, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -480,6 +570,9 @@ func LoadModel(path string) (*Model, error) {
 	var m Model
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
+	}
+	if err := m.Validate(); err != nil {
+		return nil, fmt.Errorf("model validation failed: %w", err)
 	}
 	return &m, nil
 }

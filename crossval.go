@@ -36,6 +36,9 @@ type HorizonOffsets struct {
 	P90 []float64 `json:"p90"`
 }
 
+// DefaultMaxValidPrediction defines the default ceiling on valid out-of-fold predictions (1e6).
+const DefaultMaxValidPrediction = 1e6
+
 // ChronologicalCVOptions configures chronological rolling-origin cross-validation.
 type ChronologicalCVOptions struct {
 	NumFolds             int
@@ -44,6 +47,7 @@ type ChronologicalCVOptions struct {
 	InferenceOverrides   map[int]float64 // Map of feature index -> constant value to override at validation time
 	HorizonBins          []string        // Optional custom horizon bin names (defaults to DefaultHorizonBins if nil/empty)
 	SampleWeightsConfig  *WeightConfig   // Optional sample weight config for fold training (nil uses DefaultWeightConfig)
+	MaxValidPrediction   float64         // Max valid prediction value (defaults to 1e6 when unset or <= 0.0)
 }
 
 func linearQuantile(sorted []float64, q float64) float64 {
@@ -88,8 +92,13 @@ func ChronologicalCVWithOptions(
 	if n < opts.NumFolds {
 		return HorizonOffsets{}, CVMetrics{}, fmt.Errorf("number of samples (%d) is less than numFolds (%d)", n, opts.NumFolds)
 	}
-	if opts.LeadTimeFeatureIndex >= 0 && len(X[0].Values) > 0 && opts.LeadTimeFeatureIndex >= len(X[0].Values) {
+	if opts.LeadTimeFeatureIndex >= 0 && opts.LeadTimeFeatureIndex >= len(X[0].Values) {
 		return HorizonOffsets{}, CVMetrics{}, fmt.Errorf("leadTimeFeatureIndex %d out of bounds (features len %d)", opts.LeadTimeFeatureIndex, len(X[0].Values))
+	}
+
+	maxValidPred := opts.MaxValidPrediction
+	if maxValidPred <= 0.0 || math.IsNaN(maxValidPred) || math.IsInf(maxValidPred, 0) {
+		maxValidPred = DefaultMaxValidPrediction
 	}
 
 	horizonBins := opts.HorizonBins
@@ -142,6 +151,9 @@ func ChronologicalCVWithOptions(
 			}
 
 			pred := model.Predict(fvVals)
+			if math.IsNaN(pred) || math.IsInf(pred, 0) || math.Abs(pred) > maxValidPred {
+				return HorizonOffsets{}, CVMetrics{}, fmt.Errorf("chronological CV fold %d produced invalid out-of-fold prediction: %v", k, pred)
+			}
 			res := Y[i] - pred
 
 			bin := HorizonBinForLeadTimeWithBins(leadHours, horizonBins)

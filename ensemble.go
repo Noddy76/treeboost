@@ -21,6 +21,32 @@ import (
 	"time"
 )
 
+// DefaultMaxLeafValue defines the default ceiling on individual tree leaf predictions (1e4).
+const DefaultMaxLeafValue = 1e4
+
+func resolveMaxLeafValue(val float64) float64 {
+	if val <= 0.0 || math.IsNaN(val) || math.IsInf(val, 0) {
+		return DefaultMaxLeafValue
+	}
+	return val
+}
+
+func clampLeafValue(val float64, maxLeaf float64) float64 {
+	if maxLeaf <= 0.0 || math.IsNaN(maxLeaf) || math.IsInf(maxLeaf, 0) {
+		maxLeaf = DefaultMaxLeafValue
+	}
+	if math.IsNaN(val) {
+		return 0.0
+	}
+	if math.IsInf(val, 1) || val > maxLeaf {
+		return maxLeaf
+	}
+	if math.IsInf(val, -1) || val < -maxLeaf {
+		return -maxLeaf
+	}
+	return val
+}
+
 // CatBoostParams holds hyperparameters for Symmetric GBDT (obliviated trees).
 // Reference: https://en.wikipedia.org/wiki/CatBoost
 type CatBoostParams struct {
@@ -28,6 +54,7 @@ type CatBoostParams struct {
 	Iterations   int     `json:"iterations"`
 	LearningRate float64 `json:"learning_rate"`
 	L2LeafReg    float64 `json:"l2_leaf_reg"`
+	MaxLeafValue float64 `json:"max_leaf_value,omitempty"`
 }
 
 // LightGBMParams holds hyperparameters for Leaf-wise GBDT (best-first tree growth).
@@ -39,6 +66,7 @@ type LightGBMParams struct {
 	Estimators      int     `json:"estimators"`
 	LearningRate    float64 `json:"learning_rate"`
 	L2LeafReg       float64 `json:"l2_leaf_reg"` // L2 leaf regularization parameter (lambda >= 0.0)
+	MaxLeafValue    float64 `json:"max_leaf_value,omitempty"`
 }
 
 // ExtraTreesParams holds hyperparameters for Extremely Randomized Trees.
@@ -47,10 +75,12 @@ type ExtraTreesParams struct {
 	Estimators     int     `json:"estimators"`
 	MinSamplesLeaf int     `json:"min_samples_leaf"`
 	MaxFeatures    float64 `json:"max_features"`
+	MaxLeafValue   float64 `json:"max_leaf_value,omitempty"`
 }
 
 // EnsembleConfig specifies individual algorithm parameters and weighted contribution ratios.
 type EnsembleConfig struct {
+	MaxLeafValue     float64          `json:"max_leaf_value,omitempty"`
 	CatBoostWeight   float64          `json:"catboost_weight"`
 	LightGBMWeight   float64          `json:"lightgbm_weight"`
 	ExtraTreesWeight float64          `json:"extratrees_weight"`
@@ -63,6 +93,7 @@ type EnsembleConfig struct {
 // Symmetric GBDT, Leaf-wise GBDT, and ExtraTrees into an equal-weight ensemble.
 func DefaultEnsembleConfig() EnsembleConfig {
 	return EnsembleConfig{
+		MaxLeafValue:     DefaultMaxLeafValue,
 		CatBoostWeight:   1.0 / 3.0,
 		LightGBMWeight:   1.0 / 3.0,
 		ExtraTreesWeight: 1.0 / 3.0,
@@ -226,7 +257,15 @@ func computeWeightedError(Y []float64, W []float64, indices []int) (float64, flo
 	return errorSq, mean, sumW
 }
 
-func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth int, lambda float64) []Node {
+func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth int, lambda float64, maxLeaf float64) []Node {
+	if depth < 0 {
+		depth = 0
+	} else if depth > 16 {
+		depth = 16
+	}
+	if lambda < 0.0 || math.IsNaN(lambda) || math.IsInf(lambda, 0) {
+		lambda = 0.0
+	}
 	numNodes := (1 << (depth + 1)) - 1
 	nodes := make([]Node, numNodes)
 	for i := range nodes {
@@ -296,17 +335,21 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 					var errLeft, errRight float64
 					if sumWLeft > 1e-9 {
 						errLeft = sumWY2Left - (sumWYLeft*sumWYLeft)/sumWLeft
-						if errLeft < 0 {
+						if errLeft < 0 || math.IsNaN(errLeft) || math.IsInf(errLeft, 0) {
 							errLeft = 0
 						}
 					}
 					if sumWRight > 1e-9 {
 						errRight = sumWY2Right - (sumWYRight*sumWYRight)/sumWRight
-						if errRight < 0 {
+						if errRight < 0 || math.IsNaN(errRight) || math.IsInf(errRight, 0) {
 							errRight = 0
 						}
 					}
 					totalScore += errLeft + errRight
+				}
+
+				if math.IsNaN(totalScore) || math.IsInf(totalScore, 0) {
+					continue
 				}
 
 				if totalScore < bestScore {
@@ -356,7 +399,11 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 			sumWY += data.Weights[idx] * data.Targets[idx]
 			sumW += data.Weights[idx]
 		}
-		nodes[nIdx].LeafValue = sumWY / (sumW + lambda)
+		leafVal := 0.0
+		if sumW+lambda > 1e-9 {
+			leafVal = sumWY / (sumW + lambda)
+		}
+		nodes[nIdx].LeafValue = clampLeafValue(leafVal, maxLeaf)
 	}
 
 	var prune func(curr int)
@@ -382,9 +429,9 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 	return nodes
 }
 
-func trainSymmetricTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, depth int, lambda float64) []Node {
+func trainSymmetricTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, depth int, lambda float64, maxLeaf float64) []Node {
 	data := ToColumnar(X, Y, W)
-	return trainSymmetricTreeColumnar(ws, data, depth, lambda)
+	return trainSymmetricTreeColumnar(ws, data, depth, lambda, maxLeaf)
 }
 
 // TrainSymmetricGBDTColumnar fits a CatBoost-style GBDT on ColumnarDataset without per-iteration conversions.
@@ -393,10 +440,16 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 	if n == 0 {
 		return nil, 0.0
 	}
+	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
 	baseValue := 0.0
 	if sumW > 1e-9 {
 		baseValue = sumWY / sumW
+	}
+	baseValue = clampLeafValue(baseValue, maxLeaf)
+
+	if params.Iterations <= 0 {
+		return nil, baseValue
 	}
 
 	preds := make([]float64, n)
@@ -417,7 +470,7 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 		}
 		iterData.Targets = residuals
 
-		treeNodes := trainSymmetricTreeColumnar(ws, iterData, params.Depth, params.L2LeafReg)
+		treeNodes := trainSymmetricTreeColumnar(ws, iterData, params.Depth, params.L2LeafReg, maxLeaf)
 		trees = append(trees, Tree{Nodes: treeNodes})
 
 		for i := 0; i < n; i++ {
@@ -448,7 +501,19 @@ type lgbBuildNode struct {
 	sumWY        float64
 }
 
-func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64) []Node {
+func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64) []Node {
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
+	if maxLeaves < 2 {
+		maxLeaves = 2
+	}
+	if minChildSamples < 1 {
+		minChildSamples = 1
+	}
+	if lambda < 0.0 || math.IsNaN(lambda) || math.IsInf(lambda, 0) {
+		lambda = 0.0
+	}
 	for i := 0; i < data.NumSamples; i++ {
 		ws.SampleIdxs[i] = i
 	}
@@ -465,6 +530,7 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 	if sumW+lambda > 1e-9 {
 		meanRoot = sumWY / (sumW + lambda)
 	}
+	meanRoot = clampLeafValue(meanRoot, maxLeaf)
 
 	buildNodes := make([]lgbBuildNode, 0, maxLeaves*2+1)
 	buildNodes = append(buildNodes, lgbBuildNode{
@@ -507,15 +573,22 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 						continue
 					}
 
-					gain := (leftWY*leftWY/(leftW+lambda) + rightWY*rightWY/(rightW+lambda)) - (leaf.sumWY * leaf.sumWY / (leaf.sumW + lambda))
+					parentGain := 0.0
+					if leaf.sumW+lambda > 1e-9 {
+						parentGain = (leaf.sumWY * leaf.sumWY) / (leaf.sumW + lambda)
+					}
+					gain := (leftWY*leftWY/(leftW+lambda) + rightWY*rightWY/(rightW+lambda)) - parentGain
+					if math.IsNaN(gain) || math.IsInf(gain, 0) {
+						continue
+					}
 
 					if gain > bestGain {
 						bestGain = gain
 						bestActiveIdx = i
 						bestF = f
 						bestVal = val
-						bestLeftMean = leftWY / (leftW + lambda)
-						bestRightMean = rightWY / (rightW + lambda)
+						bestLeftMean = clampLeafValue(leftWY/(leftW+lambda), maxLeaf)
+						bestRightMean = clampLeafValue(rightWY/(rightW+lambda), maxLeaf)
 						bestLeftW = leftW
 						bestLeftWY = leftWY
 						bestRightW = rightW
@@ -554,15 +627,22 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 							continue
 						}
 
-						gain := (sumWYLeft*sumWYLeft/(sumWLeft+lambda) + sumWYRight*sumWYRight/(sumWRight+lambda)) - (leaf.sumWY * leaf.sumWY / (leaf.sumW + lambda))
+						parentGain := 0.0
+						if leaf.sumW+lambda > 1e-9 {
+							parentGain = (leaf.sumWY * leaf.sumWY) / (leaf.sumW + lambda)
+						}
+						gain := (sumWYLeft*sumWYLeft/(sumWLeft+lambda) + sumWYRight*sumWYRight/(sumWRight+lambda)) - parentGain
+						if math.IsNaN(gain) || math.IsInf(gain, 0) {
+							continue
+						}
 
 						if gain > bestGain {
 							bestGain = gain
 							bestActiveIdx = i
 							bestF = f
 							bestVal = val
-							bestLeftMean = sumWYLeft / (sumWLeft + lambda)
-							bestRightMean = sumWYRight / (sumWRight + lambda)
+							bestLeftMean = clampLeafValue(sumWYLeft/(sumWLeft+lambda), maxLeaf)
+							bestRightMean = clampLeafValue(sumWYRight/(sumWRight+lambda), maxLeaf)
 							bestLeftW = sumWLeft
 							bestLeftWY = sumWYLeft
 							bestRightW = sumWRight
@@ -634,7 +714,7 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 			NodeID:       bn.nodeID,
 			SplitFeature: bn.splitFeature,
 			SplitValue:   bn.splitValue,
-			LeafValue:    bn.leafValue,
+			LeafValue:    clampLeafValue(bn.leafValue, maxLeaf),
 			LeftChild:    bn.leftChild,
 			RightChild:   bn.rightChild,
 		}
@@ -643,9 +723,9 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 	return nodes
 }
 
-func trainLeafwiseTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, maxDepth int, maxLeaves int, minChildSamples int, lambda float64) []Node {
+func trainLeafwiseTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64) []Node {
 	data := ToColumnar(X, Y, W)
-	return trainLeafwiseTreeColumnar(ws, data, maxDepth, maxLeaves, minChildSamples, lambda)
+	return trainLeafwiseTreeColumnar(ws, data, maxDepth, maxLeaves, minChildSamples, lambda, maxLeaf)
 }
 
 // TrainLeafwiseGBDTColumnar fits a leaf-wise GBDT on ColumnarDataset without per-iteration conversions.
@@ -654,10 +734,16 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 	if n == 0 {
 		return nil, 0.0
 	}
+	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
 	baseValue := 0.0
 	if sumW > 1e-9 {
 		baseValue = sumWY / sumW
+	}
+	baseValue = clampLeafValue(baseValue, maxLeaf)
+
+	if params.Estimators <= 0 {
+		return nil, baseValue
 	}
 
 	preds := make([]float64, n)
@@ -678,7 +764,7 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 		}
 		iterData.Targets = residuals
 
-		treeNodes := trainLeafwiseTreeColumnar(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples, params.L2LeafReg)
+		treeNodes := trainLeafwiseTreeColumnar(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples, params.L2LeafReg, maxLeaf)
 		trees = append(trees, Tree{Nodes: treeNodes})
 
 		for i := 0; i < n; i++ {
@@ -695,7 +781,18 @@ func TrainLeafwiseGBDT(X []FeatureVector, Y []float64, W []float64, params Light
 	return TrainLeafwiseGBDTColumnar(data, params)
 }
 
-func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDataset, sampleIdxs []int, start, end int, depth int, maxDepth int, minSamplesLeaf int, maxFeatures float64, nodes *[]Node) int {
+func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDataset, sampleIdxs []int, start, end int, depth int, maxDepth int, minSamplesLeaf int, maxFeatures float64, maxLeaf float64, nodes *[]Node) int {
+	if minSamplesLeaf < 1 {
+		minSamplesLeaf = 1
+	}
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
+	if maxFeatures <= 0.0 || math.IsNaN(maxFeatures) || math.IsInf(maxFeatures, 0) {
+		maxFeatures = 1.0
+	} else if maxFeatures > 1.0 {
+		maxFeatures = 1.0
+	}
 	nSamples := end - start
 	currIdx := len(*nodes)
 	*nodes = append(*nodes, Node{NodeID: currIdx, SplitFeature: -1, LeftChild: -1, RightChild: -1})
@@ -710,9 +807,13 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 		}
 		leafVal := 0.0
 		if sumW > 1e-9 {
-			leafVal = sumWY / sumW
+			den := sumW
+			if den < 1.0 {
+				den = 1.0
+			}
+			leafVal = sumWY / den
 		}
-		(*nodes)[currIdx].LeafValue = leafVal
+		(*nodes)[currIdx].LeafValue = clampLeafValue(leafVal, maxLeaf)
 		return currIdx
 	}
 
@@ -729,9 +830,14 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 		(*nodes)[currIdx].LeafValue = 0.0
 		return currIdx
 	}
-	meanVal := sumWY / sumW
+	den := sumW
+	if den < 1.0 {
+		den = 1.0
+	}
+	meanVal := sumWY / den
+	meanVal = clampLeafValue(meanVal, maxLeaf)
 	errVal := sumWY2 - (sumWY*sumWY)/sumW
-	if errVal <= 1e-9 {
+	if errVal <= 1e-9 || math.IsNaN(errVal) {
 		(*nodes)[currIdx].LeafValue = meanVal
 		return currIdx
 	}
@@ -781,6 +887,9 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 
 		featuresChecked++
 		val := minF + rng.Float64()*(maxF-minF)
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			continue
+		}
 
 		var sumWLeft, sumWYLeft, sumWY2Left float64
 		var sumWRight, sumWYRight, sumWY2Right float64
@@ -810,18 +919,21 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 		var errLeft, errRight float64
 		if sumWLeft > 1e-9 {
 			errLeft = sumWY2Left - (sumWYLeft*sumWYLeft)/sumWLeft
-			if errLeft < 0 {
+			if errLeft < 0 || math.IsNaN(errLeft) || math.IsInf(errLeft, 0) {
 				errLeft = 0
 			}
 		}
 		if sumWRight > 1e-9 {
 			errRight = sumWY2Right - (sumWYRight*sumWYRight)/sumWRight
-			if errRight < 0 {
+			if errRight < 0 || math.IsNaN(errRight) || math.IsInf(errRight, 0) {
 				errRight = 0
 			}
 		}
 
 		score := errLeft + errRight
+		if math.IsNaN(score) || math.IsInf(score, 0) {
+			continue
+		}
 		if score < bestScore {
 			bestScore = score
 			bestFeature = f
@@ -843,8 +955,8 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 	(*nodes)[currIdx].SplitFeature = bestFeature
 	(*nodes)[currIdx].SplitValue = bestVal
 
-	leftIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, start, mid, depth+1, maxDepth, minSamplesLeaf, maxFeatures, nodes)
-	rightIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, mid, end, depth+1, maxDepth, minSamplesLeaf, maxFeatures, nodes)
+	leftIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, start, mid, depth+1, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, nodes)
+	rightIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, mid, end, depth+1, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, nodes)
 
 	(*nodes)[currIdx].LeftChild = leftIdx
 	(*nodes)[currIdx].RightChild = rightIdx
@@ -852,12 +964,12 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 	return currIdx
 }
 
-func trainExtraTree(ws *TrainWorkspace, rng *rand.Rand, X []FeatureVector, Y []float64, W []float64, indices []int, depth int, maxDepth int, minSamplesLeaf int, maxFeatures float64) []Node {
+func trainExtraTree(ws *TrainWorkspace, rng *rand.Rand, X []FeatureVector, Y []float64, W []float64, indices []int, depth int, maxDepth int, minSamplesLeaf int, maxFeatures float64, maxLeaf float64) []Node {
 	data := ToColumnar(X, Y, W)
 	sampleIdxs := make([]int, len(indices))
 	copy(sampleIdxs, indices)
 	nodes := make([]Node, 0, 64)
-	trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, len(indices), depth, maxDepth, minSamplesLeaf, maxFeatures, &nodes)
+	trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, len(indices), depth, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, &nodes)
 	return nodes
 }
 
@@ -867,6 +979,7 @@ func TrainExtraTreesColumnar(data ColumnarDataset, params ExtraTreesParams) []Tr
 	if data.NumSamples == 0 || params.Estimators <= 0 {
 		return trees
 	}
+	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	trees = make([]Tree, 0, params.Estimators)
 	rng := rand.New(rand.NewSource(42))
 
@@ -874,6 +987,10 @@ func TrainExtraTreesColumnar(data ColumnarDataset, params ExtraTreesParams) []Tr
 	defer releaseWorkspace(ws)
 
 	sampleIdxs := make([]int, data.NumSamples)
+	minSamplesLeaf := params.MinSamplesLeaf
+	if minSamplesLeaf < 1 {
+		minSamplesLeaf = 1
+	}
 
 	for m := 0; m < params.Estimators; m++ {
 		for i := range sampleIdxs {
@@ -881,7 +998,7 @@ func TrainExtraTreesColumnar(data ColumnarDataset, params ExtraTreesParams) []Tr
 		}
 
 		nodes := make([]Node, 0, 64)
-		trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, data.NumSamples, 0, 12, params.MinSamplesLeaf, params.MaxFeatures, &nodes)
+		trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, data.NumSamples, 0, 12, minSamplesLeaf, params.MaxFeatures, maxLeaf, &nodes)
 		trees = append(trees, Tree{Nodes: nodes})
 	}
 
@@ -908,22 +1025,47 @@ func ScaleTreeLeavesInPlace(tree *Tree, factor float64) {
 func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, config EnsembleConfig) *Model {
 	data := ToColumnar(X, Y, W)
 
-	cbTrees, cbBase := TrainSymmetricGBDTColumnar(data, config.CatBoost)
-	lgbTrees, lgbBase := TrainLeafwiseGBDTColumnar(data, config.LightGBM)
-	etTrees := TrainExtraTreesColumnar(data, config.ExtraTrees)
+	maxLeaf := resolveMaxLeafValue(config.MaxLeafValue)
+	cbParams := config.CatBoost
+	if cbParams.MaxLeafValue <= 0.0 || cbParams.MaxLeafValue > maxLeaf || math.IsNaN(cbParams.MaxLeafValue) || math.IsInf(cbParams.MaxLeafValue, 0) {
+		cbParams.MaxLeafValue = maxLeaf
+	}
+	lgbParams := config.LightGBM
+	if lgbParams.MaxLeafValue <= 0.0 || lgbParams.MaxLeafValue > maxLeaf || math.IsNaN(lgbParams.MaxLeafValue) || math.IsInf(lgbParams.MaxLeafValue, 0) {
+		lgbParams.MaxLeafValue = maxLeaf
+	}
+	etParams := config.ExtraTrees
+	if etParams.MaxLeafValue <= 0.0 || etParams.MaxLeafValue > maxLeaf || math.IsNaN(etParams.MaxLeafValue) || math.IsInf(etParams.MaxLeafValue, 0) {
+		etParams.MaxLeafValue = maxLeaf
+	}
+
+	cbTrees, cbBase := TrainSymmetricGBDTColumnar(data, cbParams)
+	lgbTrees, lgbBase := TrainLeafwiseGBDTColumnar(data, lgbParams)
+	etTrees := TrainExtraTreesColumnar(data, etParams)
 
 	combinedBase := config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
+	combinedBase = clampLeafValue(combinedBase, maxLeaf)
 
 	totalTrees := len(cbTrees) + len(lgbTrees) + len(etTrees)
 	combinedTrees := make([]Tree, 0, totalTrees)
 
 	for i := range cbTrees {
 		ScaleTreeLeavesInPlace(&cbTrees[i], config.CatBoostWeight*config.CatBoost.LearningRate)
+		for j := range cbTrees[i].Nodes {
+			if cbTrees[i].Nodes[j].SplitFeature == -1 {
+				cbTrees[i].Nodes[j].LeafValue = clampLeafValue(cbTrees[i].Nodes[j].LeafValue, maxLeaf)
+			}
+		}
 		combinedTrees = append(combinedTrees, cbTrees[i])
 	}
 
 	for i := range lgbTrees {
 		ScaleTreeLeavesInPlace(&lgbTrees[i], config.LightGBMWeight*config.LightGBM.LearningRate)
+		for j := range lgbTrees[i].Nodes {
+			if lgbTrees[i].Nodes[j].SplitFeature == -1 {
+				lgbTrees[i].Nodes[j].LeafValue = clampLeafValue(lgbTrees[i].Nodes[j].LeafValue, maxLeaf)
+			}
+		}
 		combinedTrees = append(combinedTrees, lgbTrees[i])
 	}
 
@@ -933,6 +1075,11 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 	}
 	for i := range etTrees {
 		ScaleTreeLeavesInPlace(&etTrees[i], etScale)
+		for j := range etTrees[i].Nodes {
+			if etTrees[i].Nodes[j].SplitFeature == -1 {
+				etTrees[i].Nodes[j].LeafValue = clampLeafValue(etTrees[i].Nodes[j].LeafValue, maxLeaf)
+			}
+		}
 		combinedTrees = append(combinedTrees, etTrees[i])
 	}
 

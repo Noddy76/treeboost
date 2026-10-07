@@ -78,3 +78,50 @@ func TestComputeSampleWeightsWithConfig(t *testing.T) {
 		}
 	}
 }
+
+// FuzzComputeSampleWeights fuzzes sample weight calculation under arbitrary targets and configurations.
+func FuzzComputeSampleWeights(f *testing.F) {
+	f.Add(float64(10.0), float64(5.0), float64(4.0), float64(1.0), float64(1.0), float64(50.0))
+	f.Add(float64(-10.0), float64(-5.0), float64(0.0), float64(0.5), float64(2.0), float64(-100.0))
+	f.Add(float64(0.0), float64(0.0), float64(0.0), float64(0.0), float64(0.0), float64(0.0))
+	f.Add(float64(1e6), float64(1e6), float64(1e6), float64(100.0), float64(10.0), float64(1e12))
+
+	f.Fuzz(func(t *testing.T, mult, offset, subtrahend, minW, negMult, targetVal float64) {
+		cfg := WeightConfig{
+			Multiplier:         mult,
+			Offset:             offset,
+			Subtrahend:         subtrahend,
+			MinWeight:          minW,
+			NegativeMultiplier: negMult,
+		}
+
+		targets := []float64{
+			targetVal,
+			-targetVal,
+			0.0,
+			targetVal * 2.5,
+			math.NaN(),
+			math.Inf(1),
+			math.Inf(-1),
+		}
+
+		weights := ComputeSampleWeightsWithConfig(targets, cfg)
+		if len(weights) != len(targets) {
+			t.Fatalf("expected %d weights, got %d", len(targets), len(weights))
+		}
+
+		expectedMin := cfg.MinWeight
+		if expectedMin <= 0.0 || math.IsNaN(expectedMin) || math.IsInf(expectedMin, 0) {
+			expectedMin = 1.0
+		}
+
+		for i, w := range weights {
+			if math.IsNaN(w) || math.IsInf(w, 0) {
+				t.Fatalf("weight at index %d is non-finite: %f (target=%f)", i, w, targets[i])
+			}
+			if w < expectedMin {
+				t.Fatalf("weight %f at index %d is less than minWeight %f (target=%f)", w, i, expectedMin, targets[i])
+			}
+		}
+	})
+}

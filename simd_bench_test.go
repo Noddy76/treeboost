@@ -16,6 +16,7 @@ package treeboost
 
 import (
 	"fmt"
+	"math"
 	"testing"
 )
 
@@ -276,4 +277,80 @@ func BenchmarkDispatchedIndirect(b *testing.B) {
 			})
 		}
 	}
+}
+
+// FuzzSIMDWeightedSumParity tests numerical parity between SIMD dispatch and scalar fallbacks
+// across unaligned lengths, subnormals, cancellations, and extreme float scales.
+func FuzzSIMDWeightedSumParity(f *testing.F) {
+	f.Add(17, float64(1.0), float64(2.0), float64(1.5), float64(-3.0))
+	f.Add(33, float64(1e-10), float64(1e-5), float64(1e10), float64(-1e10))
+	f.Add(1, float64(0.0), float64(0.0), float64(0.0), float64(0.0))
+	f.Add(65, float64(1e300), float64(-1e300), float64(1.0), float64(-1.0))
+
+	f.Fuzz(func(t *testing.T, n int, wBase, wStep, yBase, yStep float64) {
+		if math.IsNaN(wBase) || math.IsNaN(wStep) || math.IsNaN(yBase) || math.IsNaN(yStep) {
+			return
+		}
+		if math.IsInf(wBase, 0) || math.IsInf(wStep, 0) || math.IsInf(yBase, 0) || math.IsInf(yStep, 0) {
+			return
+		}
+
+		if n < 0 {
+			n = -n
+		}
+		n = n % 256
+		if n == 0 {
+			n = 1
+		}
+
+		W := make([]float64, n)
+		Y := make([]float64, n)
+		indices := make([]int, n)
+
+		var sumAbsW, sumAbsWY float64
+		for i := 0; i < n; i++ {
+			W[i] = wBase + float64(i)*wStep
+			Y[i] = yBase + float64(i)*yStep
+			sumAbsW += math.Abs(W[i])
+			sumAbsWY += math.Abs(W[i] * Y[i])
+			indices[i] = i
+		}
+
+		scaleW := math.Max(sumAbsW, 1.0)
+		scaleWY := math.Max(sumAbsWY, 1.0)
+		relTol := 1e-4
+		absTol := 1e-4
+
+		// 1. Contiguous Parity
+		sumWContigScalar, sumWYContigScalar := computeWeightedSumContiguousScalar(W, Y)
+		sumWContigDisp, sumWYContigDisp := computeWeightedSumContiguous(W, Y)
+
+		diffW := math.Abs(sumWContigScalar - sumWContigDisp)
+		diffWY := math.Abs(sumWYContigScalar - sumWYContigDisp)
+
+		if diffW > absTol && diffW/scaleW > relTol {
+			t.Fatalf("contiguous sumW mismatch for n=%d: scalar=%e, disp=%e, diff=%e",
+				n, sumWContigScalar, sumWContigDisp, diffW)
+		}
+		if diffWY > absTol && diffWY/scaleWY > relTol {
+			t.Fatalf("contiguous sumWY mismatch for n=%d: scalar=%e, disp=%e, diff=%e",
+				n, sumWYContigScalar, sumWYContigDisp, diffWY)
+		}
+
+		// 2. Indirect Parity
+		sumWIndScalar, sumWYIndScalar := computeWeightedSumScalar(W, Y, indices)
+		sumWIndDisp, sumWYIndDisp := computeWeightedSum(W, Y, indices)
+
+		diffIndW := math.Abs(sumWIndScalar - sumWIndDisp)
+		diffIndWY := math.Abs(sumWYIndScalar - sumWYIndDisp)
+
+		if diffIndW > absTol && diffIndW/scaleW > relTol {
+			t.Fatalf("indirect sumW mismatch for n=%d: scalar=%e, disp=%e, diff=%e",
+				n, sumWIndScalar, sumWIndDisp, diffIndW)
+		}
+		if diffIndWY > absTol && diffIndWY/scaleWY > relTol {
+			t.Fatalf("indirect sumWY mismatch for n=%d: scalar=%e, disp=%e, diff=%e",
+				n, sumWYIndScalar, sumWYIndDisp, diffIndWY)
+		}
+	})
 }

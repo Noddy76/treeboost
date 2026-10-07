@@ -1138,3 +1138,94 @@ func TestHistogramSplit_Midpoint(t *testing.T) {
 		t.Errorf("FindBestHistogramSplitWithCounts: expected midpoint %f, got %f", expectedSplit, splitValC)
 	}
 }
+
+// FuzzEvaluateTree tests single tree evaluation and batch prediction with arbitrary tree topologies and features.
+func FuzzEvaluateTree(f *testing.F) {
+	f.Add(float64(5.0), float64(10.0), float64(2.5), 0, 1, 2)
+	f.Add(float64(-50.0), float64(0.0), float64(100.0), -1, -1, -1)
+	f.Add(float64(0.0), float64(1e-9), float64(-1e-9), 1, 0, 0)
+	f.Add(float64(1000.0), float64(500.0), float64(-500.0), 3, 2, 1)
+
+	f.Fuzz(func(t *testing.T, splitVal, leafLeft, leafRight float64, splitFeature, leftChild, rightChild int) {
+		nodes := []Node{
+			{NodeID: 0, SplitFeature: splitFeature % 4, SplitValue: splitVal, LeftChild: leftChild, RightChild: rightChild},
+			{NodeID: 1, SplitFeature: -1, LeafValue: leafLeft},
+			{NodeID: 2, SplitFeature: -1, LeafValue: leafRight},
+		}
+
+		features := []float64{1.0, 2.0, 3.0, 4.0}
+		fv := FeatureVector{Values: features}
+
+		// Verify EvaluateTree terminates without panicking
+		_ = EvaluateTree(nodes, fv)
+
+		// Test PredictBatch with single-tree model
+		model := &Model{
+			BaseValue:    0.0,
+			LearningRate: 1.0,
+			Trees: []Tree{
+				{Nodes: nodes},
+			},
+		}
+
+		batchFeatures := make([]float64, 8)
+		copy(batchFeatures[:4], features)
+		copy(batchFeatures[4:], features)
+		_ = model.PredictBatch(batchFeatures, 2)
+		_ = model.PredictBatch(batchFeatures, -1)
+		_ = model.PredictBatch(batchFeatures, 0)
+		_ = model.PredictBatch(nil, 2)
+
+		// Test EvaluateTreeColumnar edge cases
+		colData := ColumnarDataset{
+			NumSamples:  1,
+			NumFeatures: 4,
+			Features:    features,
+		}
+		_ = EvaluateTreeColumnar(nodes, colData, 0)
+		_ = EvaluateTreeColumnar(nodes, colData, -1)
+		_ = EvaluateTreeColumnar(nodes, colData, 5)
+	})
+}
+
+// FuzzModelDeserializationAndEvaluation tests model deserialization validation and traversal DoS safety.
+func FuzzModelDeserializationAndEvaluation(f *testing.F) {
+	// Seed 1: valid simple model JSON
+	f.Add(`{"base_value": 10.5, "learning_rate": 1.0, "trees": [{"nodes": [{"split_feature": -1, "leaf_value": 5.0}]}]}`)
+	// Seed 2: cyclic tree node pointing to itself
+	f.Add(`{"base_value": 0.0, "learning_rate": 1.0, "trees": [{"nodes": [{"split_feature": 0, "left_child": 0, "right_child": 0}]}]}`)
+	// Seed 3: out-of-bounds child pointer
+	f.Add(`{"base_value": 0.0, "learning_rate": 1.0, "trees": [{"nodes": [{"split_feature": 0, "left_child": 99999, "right_child": -1}]}]}`)
+	// Seed 4: malformed JSON
+	f.Add(`{"base_value": "not_a_number"}`)
+
+	f.Fuzz(func(t *testing.T, jsonStr string) {
+		tmpFile, err := os.CreateTemp("", "fuzz_model_*.json")
+		if err != nil {
+			return
+		}
+		defer os.Remove(tmpFile.Name())
+
+		if _, err := tmpFile.WriteString(jsonStr); err != nil {
+			tmpFile.Close()
+			return
+		}
+		tmpFile.Close()
+
+		m, err := LoadModel(tmpFile.Name())
+		if err == nil && m != nil {
+			// If LoadModel succeeded, Validate must also succeed
+			if valErr := m.Validate(); valErr != nil {
+				t.Fatalf("LoadModel succeeded on invalid model: %v", valErr)
+			}
+			// Inference must never hang or crash
+			features := []float64{1.0, 2.0, 3.0}
+			_ = m.Predict(features)
+			_ = m.PredictBatch([]float64{1.0, 2.0, 3.0, 4.0, 5.0, 6.0}, 2)
+			p10, p50, p90 := m.PredictInterval(features, 12.0)
+			if p10 > p50 || p50 > p90 {
+				t.Fatalf("interval broken on validated model: %f, %f, %f", p10, p50, p90)
+			}
+		}
+	})
+}
