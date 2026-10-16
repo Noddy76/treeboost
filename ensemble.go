@@ -486,6 +486,9 @@ func trainSymmetricTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []
 
 // TrainSymmetricGBDTColumnar fits a CatBoost-style GBDT on ColumnarDataset without per-iteration conversions.
 func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]Tree, float64) {
+	if params.LossFunction == LossPinball {
+		validateQuantileParams(params.LossFunction, params.Quantile)
+	}
 	n := data.NumSamples
 	if n == 0 {
 		return nil, 0.0
@@ -493,7 +496,6 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	baseValue := 0.0
 	if params.LossFunction == LossPinball {
-		validateQuantileParams(params.LossFunction, params.Quantile)
 		baseValue = WeightedQuantile(data.Targets, data.Weights, params.Quantile)
 	} else {
 		sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
@@ -823,6 +825,9 @@ func trainLeafwiseTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []f
 
 // TrainLeafwiseGBDTColumnar fits a leaf-wise GBDT on ColumnarDataset without per-iteration conversions.
 func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]Tree, float64) {
+	if params.LossFunction == LossPinball {
+		validateQuantileParams(params.LossFunction, params.Quantile)
+	}
 	n := data.NumSamples
 	if n == 0 {
 		return nil, 0.0
@@ -830,7 +835,6 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	baseValue := 0.0
 	if params.LossFunction == LossPinball {
-		validateQuantileParams(params.LossFunction, params.Quantile)
 		baseValue = WeightedQuantile(data.Targets, data.Weights, params.Quantile)
 	} else {
 		sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
@@ -1197,26 +1201,7 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 	lgbTrees, lgbBase := TrainLeafwiseGBDTColumnar(data, lgbParams)
 	etTrees := TrainExtraTreesColumnar(data, etParams)
 
-	var combinedBase float64
-	if config.LossFunction == LossPinball {
-		if config.ExtraTreesWeight == 0.0 || config.ExtraTrees.Estimators == 0 {
-			sumWeights := config.CatBoostWeight + config.LightGBMWeight
-			if sumWeights > 1e-9 {
-				combinedBase = (config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase) / sumWeights
-			} else {
-				combinedBase = config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
-			}
-		} else {
-			sumWeights := config.CatBoostWeight + config.LightGBMWeight + config.ExtraTreesWeight
-			if sumWeights > 1e-9 {
-				combinedBase = (config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase) / sumWeights
-			} else {
-				combinedBase = config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
-			}
-		}
-	} else {
-		combinedBase = config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
-	}
+	combinedBase := config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
 	combinedBase = clampLeafValue(combinedBase, maxLeaf)
 
 	totalTrees := len(cbTrees) + len(lgbTrees) + len(etTrees)
@@ -1293,11 +1278,15 @@ func TrainQuantileEnsembleWithWeights(X []FeatureVector, Y []float64, W []float6
 	config.ExtraTrees.LossFunction = LossPinball
 	config.ExtraTrees.Quantile = quantile
 
-	if config.ExtraTreesWeight == 0.0 || config.ExtraTrees.Estimators == 0 {
-		sumW := config.CatBoostWeight + config.LightGBMWeight
-		if sumW > 1e-9 && math.Abs(sumW-1.0) > 1e-9 {
-			config.CatBoostWeight /= sumW
-			config.LightGBMWeight /= sumW
+	totalWeight := config.CatBoostWeight + config.LightGBMWeight
+	if config.ExtraTrees.Estimators > 0 {
+		totalWeight += config.ExtraTreesWeight
+	}
+	if totalWeight > 1e-9 && math.Abs(totalWeight-1.0) > 1e-9 {
+		config.CatBoostWeight /= totalWeight
+		config.LightGBMWeight /= totalWeight
+		if config.ExtraTrees.Estimators > 0 {
+			config.ExtraTreesWeight /= totalWeight
 		}
 	}
 

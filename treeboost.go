@@ -525,8 +525,8 @@ func (m *Model) Validate() error {
 		if math.IsNaN(m.Quantile) || math.IsInf(m.Quantile, 0) || m.Quantile <= 0.0 || m.Quantile >= 1.0 {
 			return fmt.Errorf("model Quantile is invalid: %v", m.Quantile)
 		}
-		if math.IsNaN(m.PinballLoss) || math.IsInf(m.PinballLoss, 0) {
-			return fmt.Errorf("model PinballLoss is non-finite: %v", m.PinballLoss)
+		if math.IsNaN(m.PinballLoss) || math.IsInf(m.PinballLoss, 0) || m.PinballLoss < 0.0 {
+			return fmt.Errorf("model PinballLoss is invalid: %v", m.PinballLoss)
 		}
 	}
 	for tIdx, tree := range m.Trees {

@@ -138,15 +138,41 @@ func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float
 		}
 		totalW += w
 	}
+
+	wScale := 1.0
+	if totalW <= 0.0 || math.IsNaN(totalW) || math.IsInf(totalW, 0) {
+		// Attempt rescaling by maxW if weights underflowed to 0 or overflowed to Inf
+		maxW := 0.0
+		for _, idx := range valid {
+			if weights != nil && idx < len(weights) {
+				w := weights[idx]
+				if w > maxW && !math.IsNaN(w) && !math.IsInf(w, 0) {
+					maxW = w
+				}
+			}
+		}
+		if maxW > 0.0 {
+			wScale = 1.0 / maxW
+			totalW = 0.0
+			for _, idx := range valid {
+				w := 1.0
+				if weights != nil && idx < len(weights) {
+					w = weights[idx] * wScale
+				}
+				totalW += w
+			}
+		}
+	}
+
 	if totalW <= 0.0 || math.IsNaN(totalW) || math.IsInf(totalW, 0) {
 		return 0.0
 	}
 
 	getW := func(k int) float64 {
 		if weights != nil && valid[k] < len(weights) {
-			return weights[valid[k]]
+			return weights[valid[k]] * wScale
 		}
-		return 1.0
+		return 1.0 * wScale
 	}
 
 	w0 := getW(0)
@@ -169,7 +195,7 @@ func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float
 		nextC := currC + 0.5*currW + 0.5*nextW
 		if T <= nextC {
 			denom := nextC - currC
-			if denom <= 1e-12 {
+			if denom <= 0.0 || math.IsNaN(denom) {
 				return values[valid[k]]
 			}
 			t := (T - currC) / denom
@@ -209,6 +235,10 @@ func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 		if math.IsNaN(yt) || math.IsInf(yt, 0) || math.IsNaN(yp) || math.IsInf(yp, 0) {
 			continue
 		}
+		diff := yt - yp
+		if math.IsNaN(diff) || math.IsInf(diff, 0) {
+			continue
+		}
 		w := 1.0
 		if weights != nil {
 			if i >= len(weights) {
@@ -220,7 +250,6 @@ func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 			}
 		}
 
-		diff := yt - yp
 		var loss float64
 		if diff > 0 {
 			loss = q * diff
@@ -235,5 +264,9 @@ func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 	if totalW <= 0.0 || math.IsNaN(totalW) || math.IsInf(totalW, 0) {
 		return 0.0
 	}
-	return totalLoss / totalW
+	res := totalLoss / totalW
+	if math.IsNaN(res) || math.IsInf(res, 0) {
+		return 0.0
+	}
+	return res
 }

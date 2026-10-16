@@ -206,6 +206,102 @@ func TestFailFastValidation(t *testing.T) {
 			DefaultEnsembleConfig(),
 		)
 	})
+
+	// Fail-fast validation with empty samples
+	assertPanics(t, "TrainSymmetricGBDTColumnar empty samples invalid quantile", func() {
+		TrainSymmetricGBDTColumnar(ColumnarDataset{NumSamples: 0}, CatBoostParams{
+			LossFunction: LossPinball,
+			Quantile:     -0.5,
+		})
+	})
+
+	assertPanics(t, "TrainLeafwiseGBDTColumnar empty samples invalid quantile", func() {
+		TrainLeafwiseGBDTColumnar(ColumnarDataset{NumSamples: 0}, LightGBMParams{
+			LossFunction: LossPinball,
+			Quantile:     1.5,
+		})
+	})
+}
+
+func TestWeightedQuantile_InfinitesimalAndExtremeWeights(t *testing.T) {
+	vals := []float64{10.0, 20.0}
+
+	// 1e-20 weights (equal weights => median must be 15.0)
+	wSmall := []float64{1e-20, 1e-20}
+	qSmall := WeightedQuantile(vals, wSmall, 0.5)
+	if math.Abs(qSmall-15.0) > 1e-6 {
+		t.Fatalf("expected median 15.0 for 1e-20 weights, got %v", qSmall)
+	}
+
+	// 1e-300 weights (equal weights => median must be 15.0)
+	wTiny := []float64{1e-300, 1e-300}
+	qTiny := WeightedQuantile(vals, wTiny, 0.5)
+	if math.Abs(qTiny-15.0) > 1e-6 {
+		t.Fatalf("expected median 15.0 for 1e-300 weights, got %v", qTiny)
+	}
+
+	// 1e308 weights (sum overflows float64 to +Inf without scaling => median must be 15.0)
+	wHuge := []float64{1e308, 1e308}
+	qHuge := WeightedQuantile(vals, wHuge, 0.5)
+	if math.Abs(qHuge-15.0) > 1e-6 {
+		t.Fatalf("expected median 15.0 for 1e308 weights, got %v", qHuge)
+	}
+}
+
+func TestPinballLoss_ExtremeFloatBoundaries(t *testing.T) {
+	// Extreme differences that overflow float64
+	loss := PinballLoss([]float64{1e308}, []float64{-1e308}, nil, 0.5)
+	if math.IsNaN(loss) || math.IsInf(loss, 0) {
+		t.Fatalf("expected finite PinballLoss on extreme floats, got %v", loss)
+	}
+}
+
+func TestModelValidate_NegativePinballLoss(t *testing.T) {
+	m := &Model{
+		BaseValue:    0.0,
+		LearningRate: 1.0,
+		LossFunction: LossPinball,
+		Quantile:     0.5,
+		PinballLoss:  -1.0,
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatal("expected Validate to reject negative PinballLoss, but got nil")
+	}
+}
+
+func TestTrainQuantileEnsemble_WeightNormalizationWithExtraTrees(t *testing.T) {
+	X := []FeatureVector{
+		{Values: []float64{1.0, 2.0}},
+		{Values: []float64{3.0, 4.0}},
+		{Values: []float64{5.0, 6.0}},
+	}
+	Y := []float64{10.0, 20.0, 30.0}
+
+	cfg := DefaultEnsembleConfig()
+	cfg.LossFunction = LossPinball
+	cfg.Quantile = 0.5
+	cfg.CatBoostWeight = 1.0
+	cfg.LightGBMWeight = 1.0
+	cfg.ExtraTreesWeight = 1.0
+	cfg.CatBoost.Iterations = 5
+	cfg.LightGBM.Estimators = 5
+	cfg.ExtraTrees.Estimators = 10
+	cfg.ExtraTrees.MinSamplesLeaf = 1
+
+	model := TrainQuantileEnsemble(X, Y, 0.5, cfg)
+	if model == nil {
+		t.Fatal("expected non-nil model")
+	}
+	if err := model.Validate(); err != nil {
+		t.Fatalf("model validation failed: %v", err)
+	}
+
+	pred := model.Predict(X[1].Values)
+	// X[1] has target 20.0 (the exact median). All 3 algorithms predict ~20.0.
+	// An ensemble of median predictors with equal weights must predict ~20.0.
+	if math.Abs(pred-20.0) > 3.0 {
+		t.Fatalf("expected ensemble prediction ~20.0 for median sample, got %v (baseValue=%v)", pred, model.BaseValue)
+	}
 }
 
 func assertPanics(t *testing.T, name string, f func()) {
