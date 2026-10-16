@@ -15,6 +15,7 @@
 package treeboost
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"sync"
@@ -55,6 +56,8 @@ type CatBoostParams struct {
 	LearningRate float64 `json:"learning_rate"`
 	L2LeafReg    float64 `json:"l2_leaf_reg"`
 	MaxLeafValue float64 `json:"max_leaf_value,omitempty"`
+	LossFunction string  `json:"loss_function,omitempty"`
+	Quantile     float64 `json:"quantile,omitempty"`
 }
 
 // LightGBMParams holds hyperparameters for Leaf-wise GBDT (best-first tree growth).
@@ -67,6 +70,8 @@ type LightGBMParams struct {
 	LearningRate    float64 `json:"learning_rate"`
 	L2LeafReg       float64 `json:"l2_leaf_reg"` // L2 leaf regularization parameter (lambda >= 0.0)
 	MaxLeafValue    float64 `json:"max_leaf_value,omitempty"`
+	LossFunction    string  `json:"loss_function,omitempty"`
+	Quantile        float64 `json:"quantile,omitempty"`
 }
 
 // ExtraTreesParams holds hyperparameters for Extremely Randomized Trees.
@@ -76,6 +81,8 @@ type ExtraTreesParams struct {
 	MinSamplesLeaf int     `json:"min_samples_leaf"`
 	MaxFeatures    float64 `json:"max_features"`
 	MaxLeafValue   float64 `json:"max_leaf_value,omitempty"`
+	LossFunction   string  `json:"loss_function,omitempty"`
+	Quantile       float64 `json:"quantile,omitempty"`
 }
 
 // EnsembleConfig specifies individual algorithm parameters and weighted contribution ratios.
@@ -84,6 +91,8 @@ type EnsembleConfig struct {
 	CatBoostWeight   float64          `json:"catboost_weight"`
 	LightGBMWeight   float64          `json:"lightgbm_weight"`
 	ExtraTreesWeight float64          `json:"extratrees_weight"`
+	LossFunction     string           `json:"loss_function,omitempty"`
+	Quantile         float64          `json:"quantile,omitempty"`
 	CatBoost         CatBoostParams   `json:"catboost"`
 	LightGBM         LightGBMParams   `json:"lightgbm"`
 	ExtraTrees       ExtraTreesParams `json:"extratrees"`
@@ -119,6 +128,26 @@ func DefaultEnsembleConfig() EnsembleConfig {
 	}
 }
 
+// DefaultQuantileEnsembleConfig returns an ensemble configuration optimized for quantile regression,
+// setting CatBoostWeight: 0.5, LightGBMWeight: 0.5, ExtraTreesWeight: 0.0, and ExtraTrees.Estimators: 0.
+func DefaultQuantileEnsembleConfig(quantile float64) EnsembleConfig {
+	validateQuantileParams(LossPinball, quantile)
+	cfg := DefaultEnsembleConfig()
+	cfg.LossFunction = LossPinball
+	cfg.Quantile = quantile
+	cfg.CatBoostWeight = 0.5
+	cfg.LightGBMWeight = 0.5
+	cfg.ExtraTreesWeight = 0.0
+	cfg.CatBoost.LossFunction = LossPinball
+	cfg.CatBoost.Quantile = quantile
+	cfg.LightGBM.LossFunction = LossPinball
+	cfg.LightGBM.Quantile = quantile
+	cfg.ExtraTrees.LossFunction = LossPinball
+	cfg.ExtraTrees.Quantile = quantile
+	cfg.ExtraTrees.Estimators = 0
+	return cfg
+}
+
 type nodeRange struct {
 	start int
 	end   int
@@ -126,20 +155,22 @@ type nodeRange struct {
 
 // TrainWorkspace holds reusable slice buffers to eliminate heap allocations during tree construction.
 type TrainWorkspace struct {
-	SampleIdxs []int
-	PermBuf    []int
-	SplitBuf   []float64
-	Ranges     []nodeRange
-	Hist       FeatureHistogram
+	SampleIdxs      []int
+	PermBuf         []int
+	SplitBuf        []float64
+	Ranges          []nodeRange
+	Hist            FeatureHistogram
+	QuantileScratch []int
 }
 
 var trainWorkspacePool = sync.Pool{
 	New: func() interface{} {
 		return &TrainWorkspace{
-			SampleIdxs: make([]int, 0, 4096),
-			PermBuf:    make([]int, 0, 256),
-			SplitBuf:   make([]float64, 50),
-			Ranges:     make([]nodeRange, 0, 256),
+			SampleIdxs:      make([]int, 0, 4096),
+			PermBuf:         make([]int, 0, 256),
+			SplitBuf:        make([]float64, 50),
+			Ranges:          make([]nodeRange, 0, 256),
+			QuantileScratch: make([]int, 0, 4096),
 		}
 	},
 }
@@ -166,6 +197,11 @@ func acquireWorkspace(nSamples, nFeatures int) *TrainWorkspace {
 		ws.SplitBuf = make([]float64, 50)
 	} else {
 		ws.SplitBuf = ws.SplitBuf[:50]
+	}
+	if cap(ws.QuantileScratch) < nSamples {
+		ws.QuantileScratch = make([]int, 0, nSamples)
+	} else {
+		ws.QuantileScratch = ws.QuantileScratch[:0]
 	}
 	return ws
 }
@@ -257,7 +293,7 @@ func computeWeightedError(Y []float64, W []float64, indices []int) (float64, flo
 	return errorSq, mean, sumW
 }
 
-func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth int, lambda float64, maxLeaf float64) []Node {
+func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64) []Node {
 	if depth < 0 {
 		depth = 0
 	} else if depth > 16 {
@@ -393,17 +429,31 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 			nodes[nIdx].LeafValue = 0.0
 			continue
 		}
-		var sumWY, sumW float64
-		for i := r.start; i < r.end; i++ {
-			idx := ws.SampleIdxs[i]
-			sumWY += data.Weights[idx] * data.Targets[idx]
-			sumW += data.Weights[idx]
+		if lossFunction == LossPinball && len(residuals) > 0 {
+			var sumW float64
+			for i := r.start; i < r.end; i++ {
+				idx := ws.SampleIdxs[i]
+				sumW += data.Weights[idx]
+			}
+			leafVal := 0.0
+			if sumW+lambda > 1e-9 {
+				qVal := weightedQuantileIndexed(ws.SampleIdxs[r.start:r.end], residuals, data.Weights, quantile, &ws.QuantileScratch)
+				leafVal = (sumW / (sumW + lambda)) * qVal
+			}
+			nodes[nIdx].LeafValue = clampLeafValue(leafVal, maxLeaf)
+		} else {
+			var sumWY, sumW float64
+			for i := r.start; i < r.end; i++ {
+				idx := ws.SampleIdxs[i]
+				sumWY += data.Weights[idx] * data.Targets[idx]
+				sumW += data.Weights[idx]
+			}
+			leafVal := 0.0
+			if sumW+lambda > 1e-9 {
+				leafVal = sumWY / (sumW + lambda)
+			}
+			nodes[nIdx].LeafValue = clampLeafValue(leafVal, maxLeaf)
 		}
-		leafVal := 0.0
-		if sumW+lambda > 1e-9 {
-			leafVal = sumWY / (sumW + lambda)
-		}
-		nodes[nIdx].LeafValue = clampLeafValue(leafVal, maxLeaf)
 	}
 
 	var prune func(curr int)
@@ -431,7 +481,7 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 
 func trainSymmetricTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, depth int, lambda float64, maxLeaf float64) []Node {
 	data := ToColumnar(X, Y, W)
-	return trainSymmetricTreeColumnar(ws, data, depth, lambda, maxLeaf)
+	return trainSymmetricTreeColumnar(ws, data, depth, lambda, maxLeaf, "", 0.0, nil)
 }
 
 // TrainSymmetricGBDTColumnar fits a CatBoost-style GBDT on ColumnarDataset without per-iteration conversions.
@@ -441,10 +491,15 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 		return nil, 0.0
 	}
 	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
-	sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
 	baseValue := 0.0
-	if sumW > 1e-9 {
-		baseValue = sumWY / sumW
+	if params.LossFunction == LossPinball {
+		validateQuantileParams(params.LossFunction, params.Quantile)
+		baseValue = WeightedQuantile(data.Targets, data.Weights, params.Quantile)
+	} else {
+		sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
+		if sumW > 1e-9 {
+			baseValue = sumWY / sumW
+		}
 	}
 	baseValue = clampLeafValue(baseValue, maxLeaf)
 
@@ -459,6 +514,11 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 
 	trees := make([]Tree, 0, params.Iterations)
 	residuals := make([]float64, n)
+	var gradients []float64
+	isPinball := params.LossFunction == LossPinball
+	if isPinball {
+		gradients = make([]float64, n)
+	}
 
 	ws := acquireWorkspace(data.NumSamples, data.NumFeatures)
 	defer releaseWorkspace(ws)
@@ -468,9 +528,24 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 		for i := 0; i < n; i++ {
 			residuals[i] = data.Targets[i] - preds[i]
 		}
-		iterData.Targets = residuals
+		if isPinball {
+			q := params.Quantile
+			for i := 0; i < n; i++ {
+				r := residuals[i]
+				if r > 0 {
+					gradients[i] = q
+				} else if r < 0 {
+					gradients[i] = q - 1.0
+				} else {
+					gradients[i] = 0.0
+				}
+			}
+			iterData.Targets = gradients
+		} else {
+			iterData.Targets = residuals
+		}
 
-		treeNodes := trainSymmetricTreeColumnar(ws, iterData, params.Depth, params.L2LeafReg, maxLeaf)
+		treeNodes := trainSymmetricTreeColumnar(ws, iterData, params.Depth, params.L2LeafReg, maxLeaf, params.LossFunction, params.Quantile, residuals)
 		trees = append(trees, Tree{Nodes: treeNodes})
 
 		for i := 0; i < n; i++ {
@@ -501,7 +576,7 @@ type lgbBuildNode struct {
 	sumWY        float64
 }
 
-func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64) []Node {
+func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64) []Node {
 	if maxDepth < 0 {
 		maxDepth = 0
 	}
@@ -710,11 +785,29 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 
 	nodes := make([]Node, len(buildNodes))
 	for i, bn := range buildNodes {
+		leafVal := bn.leafValue
+		if bn.splitFeature == -1 && lossFunction == LossPinball && len(residuals) > 0 {
+			if bn.end-bn.start == 0 {
+				leafVal = 0.0
+			} else {
+				var sumW float64
+				for j := bn.start; j < bn.end; j++ {
+					idx := ws.SampleIdxs[j]
+					sumW += data.Weights[idx]
+				}
+				if sumW+lambda > 1e-9 {
+					qVal := weightedQuantileIndexed(ws.SampleIdxs[bn.start:bn.end], residuals, data.Weights, quantile, &ws.QuantileScratch)
+					leafVal = (sumW / (sumW + lambda)) * qVal
+				} else {
+					leafVal = 0.0
+				}
+			}
+		}
 		nodes[i] = Node{
 			NodeID:       bn.nodeID,
 			SplitFeature: bn.splitFeature,
 			SplitValue:   bn.splitValue,
-			LeafValue:    clampLeafValue(bn.leafValue, maxLeaf),
+			LeafValue:    clampLeafValue(leafVal, maxLeaf),
 			LeftChild:    bn.leftChild,
 			RightChild:   bn.rightChild,
 		}
@@ -725,7 +818,7 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 
 func trainLeafwiseTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64) []Node {
 	data := ToColumnar(X, Y, W)
-	return trainLeafwiseTreeColumnar(ws, data, maxDepth, maxLeaves, minChildSamples, lambda, maxLeaf)
+	return trainLeafwiseTreeColumnar(ws, data, maxDepth, maxLeaves, minChildSamples, lambda, maxLeaf, "", 0.0, nil)
 }
 
 // TrainLeafwiseGBDTColumnar fits a leaf-wise GBDT on ColumnarDataset without per-iteration conversions.
@@ -735,10 +828,15 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 		return nil, 0.0
 	}
 	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
-	sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
 	baseValue := 0.0
-	if sumW > 1e-9 {
-		baseValue = sumWY / sumW
+	if params.LossFunction == LossPinball {
+		validateQuantileParams(params.LossFunction, params.Quantile)
+		baseValue = WeightedQuantile(data.Targets, data.Weights, params.Quantile)
+	} else {
+		sumW, sumWY := computeWeightedSumContiguous(data.Weights, data.Targets)
+		if sumW > 1e-9 {
+			baseValue = sumWY / sumW
+		}
 	}
 	baseValue = clampLeafValue(baseValue, maxLeaf)
 
@@ -753,6 +851,11 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 
 	trees := make([]Tree, 0, params.Estimators)
 	residuals := make([]float64, n)
+	var gradients []float64
+	isPinball := params.LossFunction == LossPinball
+	if isPinball {
+		gradients = make([]float64, n)
+	}
 
 	ws := acquireWorkspace(data.NumSamples, data.NumFeatures)
 	defer releaseWorkspace(ws)
@@ -762,9 +865,24 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 		for i := 0; i < n; i++ {
 			residuals[i] = data.Targets[i] - preds[i]
 		}
-		iterData.Targets = residuals
+		if isPinball {
+			q := params.Quantile
+			for i := 0; i < n; i++ {
+				r := residuals[i]
+				if r > 0 {
+					gradients[i] = q
+				} else if r < 0 {
+					gradients[i] = q - 1.0
+				} else {
+					gradients[i] = 0.0
+				}
+			}
+			iterData.Targets = gradients
+		} else {
+			iterData.Targets = residuals
+		}
 
-		treeNodes := trainLeafwiseTreeColumnar(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples, params.L2LeafReg, maxLeaf)
+		treeNodes := trainLeafwiseTreeColumnar(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples, params.L2LeafReg, maxLeaf, params.LossFunction, params.Quantile, residuals)
 		trees = append(trees, Tree{Nodes: treeNodes})
 
 		for i := 0; i < n; i++ {
@@ -781,7 +899,7 @@ func TrainLeafwiseGBDT(X []FeatureVector, Y []float64, W []float64, params Light
 	return TrainLeafwiseGBDTColumnar(data, params)
 }
 
-func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDataset, sampleIdxs []int, start, end int, depth int, maxDepth int, minSamplesLeaf int, maxFeatures float64, maxLeaf float64, nodes *[]Node) int {
+func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDataset, sampleIdxs []int, start, end int, depth int, maxDepth int, minSamplesLeaf int, maxFeatures float64, maxLeaf float64, nodes *[]Node, lossFunction string, quantile float64) int {
 	if minSamplesLeaf < 1 {
 		minSamplesLeaf = 1
 	}
@@ -798,20 +916,24 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 	*nodes = append(*nodes, Node{NodeID: currIdx, SplitFeature: -1, LeftChild: -1, RightChild: -1})
 
 	if nSamples < minSamplesLeaf || depth >= maxDepth {
-		var sumW, sumWY float64
-		for i := start; i < end; i++ {
-			idx := sampleIdxs[i]
-			w := data.Weights[idx]
-			sumW += w
-			sumWY += w * data.Targets[idx]
-		}
 		leafVal := 0.0
-		if sumW > 1e-9 {
-			den := sumW
-			if den < 1.0 {
-				den = 1.0
+		if lossFunction == LossPinball {
+			leafVal = weightedQuantileIndexed(sampleIdxs[start:end], data.Targets, data.Weights, quantile, &ws.QuantileScratch)
+		} else {
+			var sumW, sumWY float64
+			for i := start; i < end; i++ {
+				idx := sampleIdxs[i]
+				w := data.Weights[idx]
+				sumW += w
+				sumWY += w * data.Targets[idx]
 			}
-			leafVal = sumWY / den
+			if sumW > 1e-9 {
+				den := sumW
+				if den < 1.0 {
+					den = 1.0
+				}
+				leafVal = sumWY / den
+			}
 		}
 		(*nodes)[currIdx].LeafValue = clampLeafValue(leafVal, maxLeaf)
 		return currIdx
@@ -830,15 +952,19 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 		(*nodes)[currIdx].LeafValue = 0.0
 		return currIdx
 	}
-	den := sumW
-	if den < 1.0 {
-		den = 1.0
+	var defaultLeafVal float64
+	if lossFunction == LossPinball {
+		defaultLeafVal = clampLeafValue(weightedQuantileIndexed(sampleIdxs[start:end], data.Targets, data.Weights, quantile, &ws.QuantileScratch), maxLeaf)
+	} else {
+		den := sumW
+		if den < 1.0 {
+			den = 1.0
+		}
+		defaultLeafVal = clampLeafValue(sumWY/den, maxLeaf)
 	}
-	meanVal := sumWY / den
-	meanVal = clampLeafValue(meanVal, maxLeaf)
 	errVal := sumWY2 - (sumWY*sumWY)/sumW
 	if errVal <= 1e-9 || math.IsNaN(errVal) {
-		(*nodes)[currIdx].LeafValue = meanVal
+		(*nodes)[currIdx].LeafValue = defaultLeafVal
 		return currIdx
 	}
 
@@ -942,21 +1068,21 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 	}
 
 	if bestFeature == -1 {
-		(*nodes)[currIdx].LeafValue = meanVal
+		(*nodes)[currIdx].LeafValue = defaultLeafVal
 		return currIdx
 	}
 
 	mid := partitionSamplesInPlace(sampleIdxs, start, end, data.Features, bestFeature*data.NumSamples, bestVal)
 	if mid == start || mid == end {
-		(*nodes)[currIdx].LeafValue = meanVal
+		(*nodes)[currIdx].LeafValue = defaultLeafVal
 		return currIdx
 	}
 
 	(*nodes)[currIdx].SplitFeature = bestFeature
 	(*nodes)[currIdx].SplitValue = bestVal
 
-	leftIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, start, mid, depth+1, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, nodes)
-	rightIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, mid, end, depth+1, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, nodes)
+	leftIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, start, mid, depth+1, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, nodes, lossFunction, quantile)
+	rightIdx := trainExtraTreeNodes(ws, rng, data, sampleIdxs, mid, end, depth+1, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, nodes, lossFunction, quantile)
 
 	(*nodes)[currIdx].LeftChild = leftIdx
 	(*nodes)[currIdx].RightChild = rightIdx
@@ -969,13 +1095,16 @@ func trainExtraTree(ws *TrainWorkspace, rng *rand.Rand, X []FeatureVector, Y []f
 	sampleIdxs := make([]int, len(indices))
 	copy(sampleIdxs, indices)
 	nodes := make([]Node, 0, 64)
-	trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, len(indices), depth, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, &nodes)
+	trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, len(indices), depth, maxDepth, minSamplesLeaf, maxFeatures, maxLeaf, &nodes, "", 0.0)
 	return nodes
 }
 
 // TrainExtraTreesColumnar fits an ExtraTrees regression ensemble on ColumnarDataset without per-iteration conversions.
 func TrainExtraTreesColumnar(data ColumnarDataset, params ExtraTreesParams) []Tree {
 	var trees []Tree
+	if params.LossFunction == LossPinball {
+		validateQuantileParams(params.LossFunction, params.Quantile)
+	}
 	if data.NumSamples == 0 || params.Estimators <= 0 {
 		return trees
 	}
@@ -998,7 +1127,7 @@ func TrainExtraTreesColumnar(data ColumnarDataset, params ExtraTreesParams) []Tr
 		}
 
 		nodes := make([]Node, 0, 64)
-		trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, data.NumSamples, 0, 12, minSamplesLeaf, params.MaxFeatures, maxLeaf, &nodes)
+		trainExtraTreeNodes(ws, rng, data, sampleIdxs, 0, data.NumSamples, 0, 12, minSamplesLeaf, params.MaxFeatures, maxLeaf, &nodes, params.LossFunction, params.Quantile)
 		trees = append(trees, Tree{Nodes: nodes})
 	}
 
@@ -1023,18 +1152,43 @@ func ScaleTreeLeavesInPlace(tree *Tree, factor float64) {
 // TrainEnsembleWithWeights trains a multi-algorithm tree ensemble (CatBoost, LightGBM, ExtraTrees)
 // using explicit sample weights W.
 func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, config EnsembleConfig) *Model {
+	if config.LossFunction == LossPinball {
+		validateQuantileParams(config.LossFunction, config.Quantile)
+		if config.CatBoost.LossFunction == "" {
+			config.CatBoost.LossFunction = LossPinball
+			config.CatBoost.Quantile = config.Quantile
+		}
+		if config.LightGBM.LossFunction == "" {
+			config.LightGBM.LossFunction = LossPinball
+			config.LightGBM.Quantile = config.Quantile
+		}
+		if config.ExtraTrees.LossFunction == "" {
+			config.ExtraTrees.LossFunction = LossPinball
+			config.ExtraTrees.Quantile = config.Quantile
+		}
+	}
+	cbParams := config.CatBoost
+	if cbParams.LossFunction == LossPinball {
+		validateQuantileParams(cbParams.LossFunction, cbParams.Quantile)
+	}
+	lgbParams := config.LightGBM
+	if lgbParams.LossFunction == LossPinball {
+		validateQuantileParams(lgbParams.LossFunction, lgbParams.Quantile)
+	}
+	etParams := config.ExtraTrees
+	if etParams.LossFunction == LossPinball {
+		validateQuantileParams(etParams.LossFunction, etParams.Quantile)
+	}
+
 	data := ToColumnar(X, Y, W)
 
 	maxLeaf := resolveMaxLeafValue(config.MaxLeafValue)
-	cbParams := config.CatBoost
 	if cbParams.MaxLeafValue <= 0.0 || cbParams.MaxLeafValue > maxLeaf || math.IsNaN(cbParams.MaxLeafValue) || math.IsInf(cbParams.MaxLeafValue, 0) {
 		cbParams.MaxLeafValue = maxLeaf
 	}
-	lgbParams := config.LightGBM
 	if lgbParams.MaxLeafValue <= 0.0 || lgbParams.MaxLeafValue > maxLeaf || math.IsNaN(lgbParams.MaxLeafValue) || math.IsInf(lgbParams.MaxLeafValue, 0) {
 		lgbParams.MaxLeafValue = maxLeaf
 	}
-	etParams := config.ExtraTrees
 	if etParams.MaxLeafValue <= 0.0 || etParams.MaxLeafValue > maxLeaf || math.IsNaN(etParams.MaxLeafValue) || math.IsInf(etParams.MaxLeafValue, 0) {
 		etParams.MaxLeafValue = maxLeaf
 	}
@@ -1043,7 +1197,26 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 	lgbTrees, lgbBase := TrainLeafwiseGBDTColumnar(data, lgbParams)
 	etTrees := TrainExtraTreesColumnar(data, etParams)
 
-	combinedBase := config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
+	var combinedBase float64
+	if config.LossFunction == LossPinball {
+		if config.ExtraTreesWeight == 0.0 || config.ExtraTrees.Estimators == 0 {
+			sumWeights := config.CatBoostWeight + config.LightGBMWeight
+			if sumWeights > 1e-9 {
+				combinedBase = (config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase) / sumWeights
+			} else {
+				combinedBase = config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
+			}
+		} else {
+			sumWeights := config.CatBoostWeight + config.LightGBMWeight + config.ExtraTreesWeight
+			if sumWeights > 1e-9 {
+				combinedBase = (config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase) / sumWeights
+			} else {
+				combinedBase = config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
+			}
+		}
+	} else {
+		combinedBase = config.CatBoostWeight*cbBase + config.LightGBMWeight*lgbBase
+	}
 	combinedBase = clampLeafValue(combinedBase, maxLeaf)
 
 	totalTrees := len(cbTrees) + len(lgbTrees) + len(etTrees)
@@ -1088,6 +1261,8 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 		BaseValue:    combinedBase,
 		Trees:        combinedTrees,
 		LearningRate: 1.0,
+		LossFunction: config.LossFunction,
+		Quantile:     config.Quantile,
 	}
 	model.ComputeMetrics(X, Y)
 	return model
@@ -1096,4 +1271,49 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 // TrainEnsemble trains a multi-algorithm tree ensemble combining CatBoost, LightGBM, and ExtraTrees models.
 func TrainEnsemble(X []FeatureVector, Y []float64, config EnsembleConfig) *Model {
 	return TrainEnsembleWithWeights(X, Y, ComputeSampleWeights(Y), config)
+}
+
+// TrainQuantileEnsembleWithWeights trains a multi-algorithm quantile regression ensemble
+// for target quantile using explicit sample weights W.
+func TrainQuantileEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, quantile float64, config EnsembleConfig) *Model {
+	validateQuantileParams(LossPinball, quantile)
+	if len(X) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
+	}
+	if len(W) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(W)=%d != len(Y)=%d", len(W), len(Y)))
+	}
+
+	config.LossFunction = LossPinball
+	config.Quantile = quantile
+	config.CatBoost.LossFunction = LossPinball
+	config.CatBoost.Quantile = quantile
+	config.LightGBM.LossFunction = LossPinball
+	config.LightGBM.Quantile = quantile
+	config.ExtraTrees.LossFunction = LossPinball
+	config.ExtraTrees.Quantile = quantile
+
+	if config.ExtraTreesWeight == 0.0 || config.ExtraTrees.Estimators == 0 {
+		sumW := config.CatBoostWeight + config.LightGBMWeight
+		if sumW > 1e-9 && math.Abs(sumW-1.0) > 1e-9 {
+			config.CatBoostWeight /= sumW
+			config.LightGBMWeight /= sumW
+		}
+	}
+
+	return TrainEnsembleWithWeights(X, Y, W, config)
+}
+
+// TrainQuantileEnsemble trains a multi-algorithm quantile regression ensemble
+// for target quantile defaulting to uniform sample weights (w_i = 1.0).
+func TrainQuantileEnsemble(X []FeatureVector, Y []float64, quantile float64, config EnsembleConfig) *Model {
+	validateQuantileParams(LossPinball, quantile)
+	if len(X) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
+	}
+	W := make([]float64, len(Y))
+	for i := range W {
+		W[i] = 1.0
+	}
+	return TrainQuantileEnsembleWithWeights(X, Y, W, quantile, config)
 }

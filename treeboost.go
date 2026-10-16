@@ -80,6 +80,9 @@ type Model struct {
 	HorizonBins     []string  `json:"horizon_bins,omitempty"`
 	P10Offsets      []float64 `json:"p10_offsets,omitempty"`
 	P90Offsets      []float64 `json:"p90_offsets,omitempty"`
+	LossFunction    string    `json:"loss_function,omitempty"`
+	Quantile        float64   `json:"quantile,omitempty"`
+	PinballLoss     float64   `json:"pinball_loss,omitempty"`
 	DiagnosticsJSON string    `json:"diagnostics_json,omitempty"`
 }
 
@@ -144,6 +147,9 @@ func (m *Model) ComputeMetrics(X []FeatureVector, Y []float64) {
 		m.RSquared = 1.0 - (sse / sst)
 	} else {
 		m.RSquared = 1.0
+	}
+	if m.LossFunction == LossPinball {
+		m.PinballLoss = PinballLoss(Y, preds, nil, m.Quantile)
 	}
 }
 
@@ -514,6 +520,14 @@ func (m *Model) Validate() error {
 	}
 	if math.IsNaN(m.LearningRate) || math.IsInf(m.LearningRate, 0) {
 		return errors.New("model LearningRate is non-finite")
+	}
+	if m.LossFunction == LossPinball {
+		if math.IsNaN(m.Quantile) || math.IsInf(m.Quantile, 0) || m.Quantile <= 0.0 || m.Quantile >= 1.0 {
+			return fmt.Errorf("model Quantile is invalid: %v", m.Quantile)
+		}
+		if math.IsNaN(m.PinballLoss) || math.IsInf(m.PinballLoss, 0) {
+			return fmt.Errorf("model PinballLoss is non-finite: %v", m.PinballLoss)
+		}
 	}
 	for tIdx, tree := range m.Trees {
 		numNodes := len(tree.Nodes)

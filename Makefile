@@ -40,6 +40,9 @@ fuzz:
 	go test -fuzz=FuzzComputeSampleWeights -fuzztime=$(FUZZTIME) .
 	go test -fuzz=FuzzHorizonBinAndIntervalPrediction -fuzztime=$(FUZZTIME) .
 	go test -fuzz=FuzzSIMDWeightedSumParity -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzWeightedQuantile -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzPinballLoss -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzTrainQuantileEnsemble -fuzztime=$(FUZZTIME) .
 
 generate:
 	go generate ./...
