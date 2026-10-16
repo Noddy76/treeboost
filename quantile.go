@@ -147,10 +147,9 @@ func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float
 		totalW += w
 	}
 
-	wScale := 1.0
-	if totalW <= 0.0 || math.IsNaN(totalW) || math.IsInf(totalW, 0) {
-		// Attempt rescaling by maxW if weights underflowed to 0 or overflowed to Inf
-		maxW := 0.0
+	maxW := 0.0
+	if totalW < 1e-50 || totalW > 1e50 || math.IsNaN(totalW) || math.IsInf(totalW, 0) {
+		// Attempt rescaling by maxW if weights underflow, overflow, or are close to float limits
 		for _, idx := range valid {
 			if weights != nil && idx < len(weights) {
 				w := weights[idx]
@@ -160,12 +159,11 @@ func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float
 			}
 		}
 		if maxW > 0.0 {
-			wScale = 1.0 / maxW
 			totalW = 0.0
 			for _, idx := range valid {
 				w := 1.0
 				if weights != nil && idx < len(weights) {
-					w = weights[idx] * wScale
+					w = weights[idx] / maxW
 				}
 				totalW += w
 			}
@@ -178,9 +176,12 @@ func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float
 
 	getW := func(k int) float64 {
 		if weights != nil && valid[k] < len(weights) {
-			return weights[valid[k]] * wScale
+			if maxW > 0.0 {
+				return weights[valid[k]] / maxW
+			}
+			return weights[valid[k]]
 		}
-		return 1.0 * wScale
+		return 1.0
 	}
 
 	w0 := getW(0)
@@ -279,8 +280,10 @@ func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 		var loss float64
 		if diff > 0 {
 			loss = q * diff
-		} else {
+		} else if diff < 0 {
 			loss = (q - 1.0) * diff
+		} else {
+			loss = 0.0
 		}
 		if math.IsNaN(loss) || math.IsInf(loss, 0) || loss < 0.0 {
 			continue
@@ -298,7 +301,7 @@ func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 		return 0.0
 	}
 	res := totalLoss / totalW
-	if math.IsNaN(res) || math.IsInf(res, 0) || res < 0.0 {
+	if math.IsNaN(res) || math.IsInf(res, 0) || res <= 0.0 {
 		return 0.0
 	}
 	return res

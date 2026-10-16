@@ -302,6 +302,13 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 	if lambda < 0.0 || math.IsNaN(lambda) || math.IsInf(lambda, 0) {
 		lambda = 0.0
 	}
+	if data.NumSamples > 0 && len(data.Weights) == 0 {
+		weights := make([]float64, data.NumSamples)
+		for i := range weights {
+			weights[i] = 1.0
+		}
+		data.Weights = weights
+	}
 	numNodes := (1 << (depth + 1)) - 1
 	nodes := make([]Node, numNodes)
 	for i := range nodes {
@@ -319,6 +326,7 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 	}
 	ws.Ranges[0] = nodeRange{start: 0, end: data.NumSamples}
 
+	actualDepth := depth
 	for d := 0; d < depth; d++ {
 		levelStart := (1 << d) - 1
 		levelEnd := (1 << (d + 1)) - 1
@@ -397,6 +405,7 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 		}
 
 		if bestFeature == -1 {
+			actualDepth = d
 			break
 		}
 
@@ -420,8 +429,9 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 		}
 	}
 
-	leafStart := (1 << depth) - 1
-	leafEnd := (1 << (depth + 1)) - 1
+	leafStart := (1 << actualDepth) - 1
+	leafEnd := (1 << (actualDepth + 1)) - 1
+	nodes = nodes[:leafEnd]
 	for nIdx := leafStart; nIdx < leafEnd; nIdx++ {
 		r := ws.Ranges[nIdx]
 		nodes[nIdx].SplitFeature = -1
@@ -467,11 +477,13 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 		}
 		prune(node.LeftChild)
 		prune(node.RightChild)
-		leftNode := nodes[node.LeftChild]
-		rightNode := nodes[node.RightChild]
-		if leftNode.SplitFeature == -1 && rightNode.SplitFeature == -1 && leftNode.LeafValue == 0.0 && rightNode.LeafValue == 0.0 {
-			node.SplitFeature = -1
-			node.LeafValue = 0.0
+		if node.LeftChild < len(nodes) && node.RightChild < len(nodes) {
+			leftNode := nodes[node.LeftChild]
+			rightNode := nodes[node.RightChild]
+			if leftNode.SplitFeature == -1 && rightNode.SplitFeature == -1 && leftNode.LeafValue == 0.0 && rightNode.LeafValue == 0.0 {
+				node.SplitFeature = -1
+				node.LeafValue = 0.0
+			}
 		}
 	}
 	prune(0)
@@ -609,6 +621,13 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 	}
 	if lambda < 0.0 || math.IsNaN(lambda) || math.IsInf(lambda, 0) {
 		lambda = 0.0
+	}
+	if data.NumSamples > 0 && len(data.Weights) == 0 {
+		weights := make([]float64, data.NumSamples)
+		for i := range weights {
+			weights[i] = 1.0
+		}
+		data.Weights = weights
 	}
 	for i := 0; i < data.NumSamples; i++ {
 		ws.SampleIdxs[i] = i
@@ -952,6 +971,13 @@ func trainExtraTreeNodes(ws *TrainWorkspace, rng *rand.Rand, data ColumnarDatase
 		maxFeatures = 1.0
 	} else if maxFeatures > 1.0 {
 		maxFeatures = 1.0
+	}
+	if data.NumSamples > 0 && len(data.Weights) == 0 {
+		weights := make([]float64, data.NumSamples)
+		for i := range weights {
+			weights[i] = 1.0
+		}
+		data.Weights = weights
 	}
 	nSamples := end - start
 	currIdx := len(*nodes)
@@ -1335,8 +1361,14 @@ func TrainQuantileEnsembleWithWeights(X []FeatureVector, Y []float64, W []float6
 	if len(X) != len(Y) {
 		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
 	}
-	if len(W) != len(Y) {
+	if len(W) > 0 && len(W) != len(Y) {
 		panic(fmt.Sprintf("treeboost: length mismatch: len(W)=%d != len(Y)=%d", len(W), len(Y)))
+	}
+	if len(W) == 0 && len(Y) > 0 {
+		W = make([]float64, len(Y))
+		for i := range W {
+			W[i] = 1.0
+		}
 	}
 
 	config.LossFunction = LossPinball
@@ -1368,13 +1400,5 @@ func TrainQuantileEnsembleWithWeights(X []FeatureVector, Y []float64, W []float6
 // TrainQuantileEnsemble trains a multi-algorithm quantile regression ensemble
 // for target quantile defaulting to uniform sample weights (w_i = 1.0).
 func TrainQuantileEnsemble(X []FeatureVector, Y []float64, quantile float64, config EnsembleConfig) *Model {
-	validateQuantileParams(LossPinball, quantile)
-	if len(X) != len(Y) {
-		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
-	}
-	W := make([]float64, len(Y))
-	for i := range W {
-		W[i] = 1.0
-	}
-	return TrainQuantileEnsembleWithWeights(X, Y, W, quantile, config)
+	return TrainQuantileEnsembleWithWeights(X, Y, nil, quantile, config)
 }

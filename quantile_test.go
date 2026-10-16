@@ -705,6 +705,123 @@ func TestModelSerializationRoundtrip_Quantile(t *testing.T) {
 	}
 }
 
+func TestTrainQuantileEnsembleWithWeights_NilAndEmptyWeights(t *testing.T) {
+	X := []FeatureVector{
+		{Values: []float64{1.0, 2.0}},
+		{Values: []float64{3.0, 4.0}},
+		{Values: []float64{5.0, 6.0}},
+		{Values: []float64{7.0, 8.0}},
+	}
+	Y := []float64{10.0, 20.0, 30.0, 40.0}
+	cfg := DefaultQuantileEnsembleConfig(0.5)
+	cfg.CatBoost.Iterations = 2
+	cfg.LightGBM.Estimators = 2
+
+	// Nil weights should default to uniform weights without panicking
+	mNil := TrainQuantileEnsembleWithWeights(X, Y, nil, 0.5, cfg)
+	if mNil == nil {
+		t.Fatalf("expected non-nil model for nil weights")
+	}
+
+	// Empty weights slice should default to uniform weights without panicking
+	mEmpty := TrainQuantileEnsembleWithWeights(X, Y, []float64{}, 0.5, cfg)
+	if mEmpty == nil {
+		t.Fatalf("expected non-nil model for empty weights slice")
+	}
+
+	// Parity with TrainQuantileEnsemble
+	mUniform := TrainQuantileEnsemble(X, Y, 0.5, cfg)
+	pNil := mNil.Predict([]float64{2.5, 3.5})
+	pEmpty := mEmpty.Predict([]float64{2.5, 3.5})
+	pUniform := mUniform.Predict([]float64{2.5, 3.5})
+	if math.Abs(pNil-pUniform) > 1e-9 {
+		t.Fatalf("expected nil weights prediction to match uniform: %v vs %v", pNil, pUniform)
+	}
+	if math.Abs(pEmpty-pUniform) > 1e-9 {
+		t.Fatalf("expected empty weights prediction to match uniform: %v vs %v", pEmpty, pUniform)
+	}
+}
+
+func TestSymmetricTree_EarlyTerminationLeafFit(t *testing.T) {
+	// Constant feature values -> split search terminates early at d = 0
+	X := []FeatureVector{
+		{Values: []float64{1.0}},
+		{Values: []float64{1.0}},
+		{Values: []float64{1.0}},
+	}
+	Y := []float64{10.0, 20.0, 30.0}
+	ws := acquireWorkspace(3, 1)
+	defer releaseWorkspace(ws)
+
+	// Symmetric tree with depth 3 on constant features should fit leaf 0 to mean (20.0)
+	nodes := trainSymmetricTree(ws, X, Y, nil, 3, 0.0, 1e4)
+	if len(nodes) == 0 {
+		t.Fatalf("expected non-empty nodes")
+	}
+	pred := EvaluateTree(nodes, X[0])
+	if math.Abs(pred-20.0) > 1e-6 {
+		t.Fatalf("expected prediction 20.0 for early-terminated symmetric tree, got %v", pred)
+	}
+
+	// Also verify quantile mode on early-terminated tree
+	nodesQ := trainSymmetricTreeColumnar(ws, ToColumnar(X, Y, nil), 3, 0.0, 1e4, LossPinball, 0.5, []float64{10.0, 20.0, 30.0})
+	predQ := EvaluateTree(nodesQ, X[0])
+	if math.Abs(predQ-20.0) > 1e-6 {
+		t.Fatalf("expected quantile prediction 20.0 for early-terminated symmetric tree, got %v", predQ)
+	}
+}
+
+func TestInternalTreeBuilders_NilWeights(t *testing.T) {
+	X := []FeatureVector{
+		{Values: []float64{1.0, 2.0}},
+		{Values: []float64{3.0, 4.0}},
+	}
+	Y := []float64{10.0, 20.0}
+	ws := acquireWorkspace(2, 2)
+	defer releaseWorkspace(ws)
+
+	// Direct trainSymmetricTree with nil weights
+	nodesSym := trainSymmetricTree(ws, X, Y, nil, 2, 0.0, 1e4)
+	if len(nodesSym) == 0 {
+		t.Fatalf("expected non-empty symmetric tree nodes")
+	}
+
+	// Direct trainLeafwiseTree with nil weights
+	nodesLgb := trainLeafwiseTree(ws, X, Y, nil, 2, 4, 1, 0.0, 1e4)
+	if len(nodesLgb) == 0 {
+		t.Fatalf("expected non-empty leafwise tree nodes")
+	}
+
+	// Direct trainExtraTree with nil weights
+	rng := rand.New(rand.NewSource(42))
+	nodesEt := trainExtraTree(ws, rng, X, Y, nil, []int{0, 1}, 0, 4, 1, 1.0, 1e4)
+	if len(nodesEt) == 0 {
+		t.Fatalf("expected non-empty extratrees nodes")
+	}
+}
+
+func TestWeightedQuantile_SubnormalWeights(t *testing.T) {
+	vals := []float64{10.0, 20.0}
+	weights := []float64{5e-324, 5e-324} // math.SmallestNonzeroFloat64
+	res := WeightedQuantile(vals, weights, 0.5)
+	if math.Abs(res-15.0) > 1e-9 {
+		t.Fatalf("expected 15.0 for subnormal weights, got %v", res)
+	}
+}
+
+func TestPinballLoss_ExactPredictionNoNegativeZero(t *testing.T) {
+	loss := PinballLoss([]float64{10.0}, []float64{10.0}, nil, 0.5)
+	if loss != 0.0 || math.Signbit(loss) {
+		t.Fatalf("expected +0.0 without negative zero sign bit, got %v (signbit=%v)", loss, math.Signbit(loss))
+	}
+
+	// Multiple exact predictions
+	lossMulti := PinballLoss([]float64{10.0, 20.0, 30.0}, []float64{10.0, 20.0, 30.0}, nil, 0.1)
+	if lossMulti != 0.0 || math.Signbit(lossMulti) {
+		t.Fatalf("expected +0.0 without negative zero sign bit, got %v (signbit=%v)", lossMulti, math.Signbit(lossMulti))
+	}
+}
+
 // FuzzWeightedQuantile tests WeightedQuantile against adversarial and arbitrary inputs.
 func FuzzWeightedQuantile(f *testing.F) {
 	f.Add(1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 0.5)
