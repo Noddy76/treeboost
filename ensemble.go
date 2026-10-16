@@ -493,6 +493,19 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 	if n == 0 {
 		return nil, 0.0
 	}
+	if len(data.Targets) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Targets)=%d != NumSamples=%d", len(data.Targets), n))
+	}
+	if len(data.Weights) > 0 && len(data.Weights) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Weights)=%d != NumSamples=%d", len(data.Weights), n))
+	}
+	if len(data.Weights) == 0 {
+		weights := make([]float64, n)
+		for i := range weights {
+			weights[i] = 1.0
+		}
+		data.Weights = weights
+	}
 	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	baseValue := 0.0
 	if params.LossFunction == LossPinball {
@@ -560,6 +573,12 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 
 // TrainSymmetricGBDT fits a symmetric (CatBoost-style) gradient boosted decision tree ensemble.
 func TrainSymmetricGBDT(X []FeatureVector, Y []float64, W []float64, params CatBoostParams) ([]Tree, float64) {
+	if len(X) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
+	}
+	if len(W) > 0 && len(W) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(W)=%d != len(Y)=%d", len(W), len(Y)))
+	}
 	data := ToColumnar(X, Y, W)
 	return TrainSymmetricGBDTColumnar(data, params)
 }
@@ -832,6 +851,19 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 	if n == 0 {
 		return nil, 0.0
 	}
+	if len(data.Targets) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Targets)=%d != NumSamples=%d", len(data.Targets), n))
+	}
+	if len(data.Weights) > 0 && len(data.Weights) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Weights)=%d != NumSamples=%d", len(data.Weights), n))
+	}
+	if len(data.Weights) == 0 {
+		weights := make([]float64, n)
+		for i := range weights {
+			weights[i] = 1.0
+		}
+		data.Weights = weights
+	}
 	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	baseValue := 0.0
 	if params.LossFunction == LossPinball {
@@ -899,6 +931,12 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 
 // TrainLeafwiseGBDT fits a leaf-wise (LightGBM-style) gradient boosted decision tree ensemble.
 func TrainLeafwiseGBDT(X []FeatureVector, Y []float64, W []float64, params LightGBMParams) ([]Tree, float64) {
+	if len(X) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
+	}
+	if len(W) > 0 && len(W) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(W)=%d != len(Y)=%d", len(W), len(Y)))
+	}
 	data := ToColumnar(X, Y, W)
 	return TrainLeafwiseGBDTColumnar(data, params)
 }
@@ -1109,8 +1147,22 @@ func TrainExtraTreesColumnar(data ColumnarDataset, params ExtraTreesParams) []Tr
 	if params.LossFunction == LossPinball {
 		validateQuantileParams(params.LossFunction, params.Quantile)
 	}
-	if data.NumSamples == 0 || params.Estimators <= 0 {
+	n := data.NumSamples
+	if n == 0 || params.Estimators <= 0 {
 		return trees
+	}
+	if len(data.Targets) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Targets)=%d != NumSamples=%d", len(data.Targets), n))
+	}
+	if len(data.Weights) > 0 && len(data.Weights) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Weights)=%d != NumSamples=%d", len(data.Weights), n))
+	}
+	if len(data.Weights) == 0 {
+		weights := make([]float64, n)
+		for i := range weights {
+			weights[i] = 1.0
+		}
+		data.Weights = weights
 	}
 	maxLeaf := resolveMaxLeafValue(params.MaxLeafValue)
 	trees = make([]Tree, 0, params.Estimators)
@@ -1140,6 +1192,12 @@ func TrainExtraTreesColumnar(data ColumnarDataset, params ExtraTreesParams) []Tr
 
 // TrainExtraTrees fits an Extremely Randomized Trees (ExtraTrees) regression ensemble.
 func TrainExtraTrees(X []FeatureVector, Y []float64, W []float64, params ExtraTreesParams) []Tree {
+	if len(X) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
+	}
+	if len(W) > 0 && len(W) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(W)=%d != len(Y)=%d", len(W), len(Y)))
+	}
 	data := ToColumnar(X, Y, W)
 	return TrainExtraTreesColumnar(data, params)
 }
@@ -1156,6 +1214,18 @@ func ScaleTreeLeavesInPlace(tree *Tree, factor float64) {
 // TrainEnsembleWithWeights trains a multi-algorithm tree ensemble (CatBoost, LightGBM, ExtraTrees)
 // using explicit sample weights W.
 func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, config EnsembleConfig) *Model {
+	if len(X) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
+	}
+	if len(W) > 0 && len(W) != len(Y) {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(W)=%d != len(Y)=%d", len(W), len(Y)))
+	}
+	if len(W) == 0 && len(Y) > 0 {
+		W = make([]float64, len(Y))
+		for i := range W {
+			W[i] = 1.0
+		}
+	}
 	if config.LossFunction == LossPinball {
 		validateQuantileParams(config.LossFunction, config.Quantile)
 		if config.CatBoost.LossFunction == "" {
@@ -1281,6 +1351,8 @@ func TrainQuantileEnsembleWithWeights(X []FeatureVector, Y []float64, W []float6
 	totalWeight := config.CatBoostWeight + config.LightGBMWeight
 	if config.ExtraTrees.Estimators > 0 {
 		totalWeight += config.ExtraTreesWeight
+	} else {
+		config.ExtraTreesWeight = 0.0
 	}
 	if totalWeight > 1e-9 && math.Abs(totalWeight-1.0) > 1e-9 {
 		config.CatBoostWeight /= totalWeight

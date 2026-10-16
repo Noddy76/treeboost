@@ -304,6 +304,159 @@ func TestTrainQuantileEnsemble_WeightNormalizationWithExtraTrees(t *testing.T) {
 	}
 }
 
+func TestWeightedQuantile_EmptyWeightsSlice(t *testing.T) {
+	vals := []float64{10.0, 20.0, 30.0}
+	emptyWeights := []float64{}
+	q := WeightedQuantile(vals, emptyWeights, 0.5)
+	if math.Abs(q-20.0) > 1e-6 {
+		t.Fatalf("expected median 20.0 for empty weights slice (uniform weighting), got %v", q)
+	}
+}
+
+func TestPinballLoss_EmptyWeightsSlice(t *testing.T) {
+	yTrue := []float64{10.0}
+	yPred := []float64{20.0}
+	emptyWeights := []float64{}
+	loss := PinballLoss(yTrue, yPred, emptyWeights, 0.5)
+	if math.Abs(loss-5.0) > 1e-6 {
+		t.Fatalf("expected loss 5.0 for empty weights slice (uniform weighting), got %v", loss)
+	}
+}
+
+func TestPinballLoss_MismatchedWeightsLength(t *testing.T) {
+	yTrue := []float64{10.0, 20.0, 30.0}
+	yPred := []float64{0.0, 0.0, 0.0}
+	mismatchedWeights := []float64{1.0}
+	loss := PinballLoss(yTrue, yPred, mismatchedWeights, 0.5)
+	if loss != 0.0 {
+		t.Fatalf("expected 0.0 on length mismatch between datasets and weights, got %v", loss)
+	}
+}
+
+func TestWeightedQuantile_MismatchedWeightsLength(t *testing.T) {
+	vals := []float64{10.0, 20.0, 30.0}
+	mismatchedWeights := []float64{1.0}
+	q := WeightedQuantile(vals, mismatchedWeights, 0.5)
+	if q != 0.0 {
+		t.Fatalf("expected 0.0 on length mismatch between values and weights, got %v", q)
+	}
+}
+
+func TestWeightedQuantile_ExtremeFiniteValues(t *testing.T) {
+	// Midpoint interpolation between -1e308 and 1e308 must be 0.0 without overflowing to Inf
+	vals := []float64{-1e308, 1e308}
+	q := WeightedQuantile(vals, nil, 0.5)
+	if math.IsNaN(q) || math.IsInf(q, 0) || math.Abs(q) > 1e-6 {
+		t.Fatalf("expected 0.0 without overflow for extreme finite values, got %v", q)
+	}
+}
+
+func TestTrainGBDT_NilAndEmptyWeights(t *testing.T) {
+	X := []FeatureVector{
+		{Values: []float64{1.0, 2.0}},
+		{Values: []float64{3.0, 4.0}},
+		{Values: []float64{5.0, 6.0}},
+		{Values: []float64{7.0, 8.0}},
+	}
+	Y := []float64{10.0, 20.0, 30.0, 40.0}
+
+	cbParams := CatBoostParams{Depth: 2, Iterations: 2, LearningRate: 0.1, LossFunction: LossPinball, Quantile: 0.5}
+	lgbParams := LightGBMParams{MaxDepth: 2, MaxLeaves: 4, MinChildSamples: 1, Estimators: 2, LearningRate: 0.1, LossFunction: LossPinball, Quantile: 0.5}
+	etParams := ExtraTreesParams{Estimators: 2, MinSamplesLeaf: 1, MaxFeatures: 1.0, LossFunction: LossPinball, Quantile: 0.5}
+
+	// Test nil weights
+	cbTrees, cbBase := TrainSymmetricGBDT(X, Y, nil, cbParams)
+	if len(cbTrees) != 2 || cbBase == 0.0 {
+		t.Fatalf("TrainSymmetricGBDT failed with nil weights")
+	}
+
+	lgbTrees, lgbBase := TrainLeafwiseGBDT(X, Y, nil, lgbParams)
+	if len(lgbTrees) != 2 || lgbBase == 0.0 {
+		t.Fatalf("TrainLeafwiseGBDT failed with nil weights")
+	}
+
+	etTrees := TrainExtraTrees(X, Y, nil, etParams)
+	if len(etTrees) != 2 {
+		t.Fatalf("TrainExtraTrees failed with nil weights")
+	}
+
+	// Test empty weights slice []float64{}
+	cbTreesEmpty, _ := TrainSymmetricGBDT(X, Y, []float64{}, cbParams)
+	if len(cbTreesEmpty) != 2 {
+		t.Fatalf("TrainSymmetricGBDT failed with empty weights slice")
+	}
+
+	lgbTreesEmpty, _ := TrainLeafwiseGBDT(X, Y, []float64{}, lgbParams)
+	if len(lgbTreesEmpty) != 2 {
+		t.Fatalf("TrainLeafwiseGBDT failed with empty weights slice")
+	}
+
+	etTreesEmpty := TrainExtraTrees(X, Y, []float64{}, etParams)
+	if len(etTreesEmpty) != 2 {
+		t.Fatalf("TrainExtraTrees failed with empty weights slice")
+	}
+}
+
+func TestFailFastValidation_MismatchedLengths(t *testing.T) {
+	X := []FeatureVector{{Values: []float64{1.0}}, {Values: []float64{2.0}}}
+	Y := []float64{10.0}
+	W := []float64{1.0, 2.0}
+	cbParams := CatBoostParams{LossFunction: LossPinball, Quantile: 0.5}
+	lgbParams := LightGBMParams{LossFunction: LossPinball, Quantile: 0.5}
+	etParams := ExtraTreesParams{LossFunction: LossPinball, Quantile: 0.5}
+
+	assertPanics(t, "TrainSymmetricGBDT X-Y length mismatch", func() {
+		TrainSymmetricGBDT(X, Y, nil, cbParams)
+	})
+	assertPanics(t, "TrainLeafwiseGBDT X-Y length mismatch", func() {
+		TrainLeafwiseGBDT(X, Y, nil, lgbParams)
+	})
+	assertPanics(t, "TrainExtraTrees X-Y length mismatch", func() {
+		TrainExtraTrees(X, Y, nil, etParams)
+	})
+	assertPanics(t, "TrainEnsembleWithWeights X-Y length mismatch", func() {
+		TrainEnsembleWithWeights(X, Y, nil, EnsembleConfig{LossFunction: LossPinball, Quantile: 0.5})
+	})
+	assertPanics(t, "TrainSymmetricGBDT W-Y length mismatch", func() {
+		TrainSymmetricGBDT([]FeatureVector{{Values: []float64{1.0}}}, []float64{10.0}, W, cbParams)
+	})
+	assertPanics(t, "TrainLeafwiseGBDT W-Y length mismatch", func() {
+		TrainLeafwiseGBDT([]FeatureVector{{Values: []float64{1.0}}}, []float64{10.0}, W, lgbParams)
+	})
+	assertPanics(t, "TrainExtraTrees W-Y length mismatch", func() {
+		TrainExtraTrees([]FeatureVector{{Values: []float64{1.0}}}, []float64{10.0}, W, etParams)
+	})
+	assertPanics(t, "TrainEnsembleWithWeights W-Y length mismatch", func() {
+		TrainEnsembleWithWeights([]FeatureVector{{Values: []float64{1.0}}}, []float64{10.0}, W, EnsembleConfig{LossFunction: LossPinball, Quantile: 0.5})
+	})
+}
+
+func TestQuantileBoosting_DeepTrees(t *testing.T) {
+	// Quantile boosting with Depth 13 (8192 leaves)
+	rng := rand.New(rand.NewSource(99))
+	n := 100
+	X := make([]FeatureVector, n)
+	Y := make([]float64, n)
+	for i := 0; i < n; i++ {
+		X[i] = FeatureVector{Values: []float64{rng.Float64(), rng.Float64()}}
+		Y[i] = rng.Float64() * 100.0
+	}
+	cbParams := CatBoostParams{
+		Depth:        13,
+		Iterations:   2,
+		LearningRate: 0.1,
+		LossFunction: LossPinball,
+		Quantile:     0.5,
+	}
+	trees, base := TrainSymmetricGBDT(X, Y, nil, cbParams)
+	if len(trees) != 2 {
+		t.Fatalf("expected 2 trees for depth 13, got %d", len(trees))
+	}
+	if math.IsNaN(base) || math.IsInf(base, 0) {
+		t.Fatalf("expected finite baseValue for depth 13, got %v", base)
+	}
+}
+
 func assertPanics(t *testing.T, name string, f func()) {
 	t.Helper()
 	defer func() {

@@ -50,6 +50,11 @@ func WeightedQuantile(values []float64, weights []float64, q float64) float64 {
 	if len(values) == 0 {
 		return 0.0
 	}
+	if len(weights) == 0 {
+		weights = nil
+	} else if len(weights) != len(values) {
+		return 0.0
+	}
 	sampleIdxs := make([]int, len(values))
 	for i := range sampleIdxs {
 		sampleIdxs[i] = i
@@ -63,6 +68,9 @@ func WeightedQuantile(values []float64, weights []float64, q float64) float64 {
 func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float64, q float64, scratch *[]int) float64 {
 	if len(sampleIdxs) == 0 || len(values) == 0 {
 		return 0.0
+	}
+	if len(weights) == 0 {
+		weights = nil
 	}
 	if math.IsNaN(q) {
 		return 0.0
@@ -199,9 +207,22 @@ func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float
 				return values[valid[k]]
 			}
 			t := (T - currC) / denom
+			if t < 0.0 {
+				t = 0.0
+			} else if t > 1.0 {
+				t = 1.0
+			}
 			vk := values[valid[k]]
 			vk1 := values[valid[k+1]]
-			return vk + t*(vk1-vk)
+			diff := vk1 - vk
+			if math.IsInf(diff, 0) {
+				res := (1.0-t)*vk + t*vk1
+				if math.IsNaN(res) || math.IsInf(res, 0) {
+					return vk
+				}
+				return res
+			}
+			return vk + t*diff
 		}
 		currC = nextC
 		currW = nextW
@@ -217,6 +238,11 @@ func weightedQuantileIndexed(sampleIdxs []int, values []float64, weights []float
 // Returns 0.0 if datasets are empty, length mismatched, or total valid weight is non-positive.
 func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 	if len(yTrue) == 0 || len(yPred) == 0 || len(yTrue) != len(yPred) {
+		return 0.0
+	}
+	if len(weights) == 0 {
+		weights = nil
+	} else if len(weights) != len(yTrue) {
 		return 0.0
 	}
 	if math.IsNaN(q) || math.IsInf(q, 0) {
@@ -256,8 +282,15 @@ func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 		} else {
 			loss = (q - 1.0) * diff
 		}
+		if math.IsNaN(loss) || math.IsInf(loss, 0) || loss < 0.0 {
+			continue
+		}
+		wl := w * loss
+		if math.IsNaN(wl) || math.IsInf(wl, 0) || wl < 0.0 {
+			continue
+		}
 
-		totalLoss += w * loss
+		totalLoss += wl
 		totalW += w
 	}
 
@@ -265,7 +298,7 @@ func PinballLoss(yTrue, yPred, weights []float64, q float64) float64 {
 		return 0.0
 	}
 	res := totalLoss / totalW
-	if math.IsNaN(res) || math.IsInf(res, 0) {
+	if math.IsNaN(res) || math.IsInf(res, 0) || res < 0.0 {
 		return 0.0
 	}
 	return res
