@@ -15,6 +15,7 @@
 package treeboost
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -595,6 +596,253 @@ func FuzzTrainEnsembleWithWeights(f *testing.F) {
 				}
 			}
 			pred := model.Predict([]float64{2.0, 3.0})
+			if math.IsNaN(pred) || math.IsInf(pred, 0) {
+				t.Fatalf("non-finite prediction: %f", pred)
+			}
+		}
+	})
+}
+
+func TestEnsemble_ColsampleFeatureSelection(t *testing.T) {
+	// 1. Parameter validation: non-finite or out-of-bounds colsample must panic immediately
+	invalidColsamples := []float64{-0.1, -1.0, 1.5, math.NaN(), math.Inf(1), math.Inf(-1)}
+	for _, val := range invalidColsamples {
+		assertPanics(t, fmt.Sprintf("CatBoost ColsampleByTree=%f", val), func() {
+			cfg := DefaultEnsembleConfig()
+			cfg.CatBoost.ColsampleByTree = val
+			TrainEnsembleWithWeights([]FeatureVector{{Values: []float64{1.0, 2.0}}}, []float64{1.0}, nil, cfg)
+		})
+		assertPanics(t, fmt.Sprintf("LightGBM ColsampleByNode=%f", val), func() {
+			cfg := DefaultEnsembleConfig()
+			cfg.LightGBM.ColsampleByNode = val
+			TrainEnsembleWithWeights([]FeatureVector{{Values: []float64{1.0, 2.0}}}, []float64{1.0}, nil, cfg)
+		})
+	}
+
+	// 2. Boundary and valid ratios: 0.0 defaults to 1.0; 0.5 selects subset
+	rng := rand.New(rand.NewSource(42))
+	const nSamples = 100
+	const nFeatures = 12
+	X := make([]FeatureVector, nSamples)
+	Y := make([]float64, nSamples)
+	for i := 0; i < nSamples; i++ {
+		vals := make([]float64, nFeatures)
+		for f := 0; f < nFeatures; f++ {
+			vals[f] = rng.Float64()*10.0 - 5.0
+		}
+		X[i] = FeatureVector{Values: vals}
+		Y[i] = vals[0]*2.0 + vals[1]*3.0 + rng.NormFloat64()*0.1
+	}
+
+	cfg := DefaultEnsembleConfig()
+	cfg.ColsampleByTree = 0.5
+	cfg.ColsampleByNode = 0.7
+	cfg.CatBoost.Iterations = 10
+	cfg.LightGBM.Estimators = 10
+	cfg.ExtraTrees.Estimators = 0
+
+	model := TrainEnsemble(X, Y, cfg)
+	if model == nil {
+		t.Fatalf("expected non-nil model with colsample")
+	}
+	pred := model.Predict(X[0].Values)
+	if math.IsNaN(pred) || math.IsInf(pred, 0) {
+		t.Fatalf("invalid prediction: %f", pred)
+	}
+}
+
+func TestEnsemble_EarlyStopping(t *testing.T) {
+	// Negative patience must panic
+	assertPanics(t, "EarlyStoppingPatience=-5", func() {
+		cfg := DefaultEnsembleConfig()
+		cfg.EarlyStoppingPatience = -5
+		TrainEnsembleWithWeights([]FeatureVector{{Values: []float64{1.0, 2.0}}}, []float64{1.0}, nil, cfg)
+	})
+
+	// Generate synthetic training & validation set where training overfits after iteration 10
+	rng := rand.New(rand.NewSource(99))
+	const nTrain = 200
+	const nVal = 80
+	const nFeatures = 8
+
+	makeData := func(n int) ([]FeatureVector, []float64) {
+		X := make([]FeatureVector, n)
+		Y := make([]float64, n)
+		for i := 0; i < n; i++ {
+			vals := make([]float64, nFeatures)
+			for f := 0; f < nFeatures; f++ {
+				vals[f] = rng.Float64()*4.0 - 2.0
+			}
+			X[i] = FeatureVector{Values: vals}
+			Y[i] = vals[0]*3.0 - vals[1]*2.0 + rng.NormFloat64()*0.5
+		}
+		return X, Y
+	}
+
+	trainX, trainY := makeData(nTrain)
+	valX, valY := makeData(nVal)
+
+	// Train Symmetric GBDT with high iteration budget (150) and EarlyStoppingPatience = 5
+	cbParams := CatBoostParams{
+		Depth:                 4,
+		Iterations:            150,
+		LearningRate:          0.1,
+		L2LeafReg:             1.0,
+		EarlyStoppingPatience: 5,
+		ValidationX:           valX,
+		ValidationY:           valY,
+	}
+	cbTrees, _ := TrainSymmetricGBDT(trainX, trainY, nil, cbParams)
+	if len(cbTrees) >= 150 {
+		t.Errorf("expected early stopping to truncate CatBoost trees before 150 iterations, got %d", len(cbTrees))
+	}
+	if len(cbTrees) == 0 {
+		t.Errorf("expected non-zero trees from early stopping, got 0")
+	}
+
+	// Train Leaf-wise GBDT with high iteration budget (150) and EarlyStoppingPatience = 5
+	lgbParams := LightGBMParams{
+		MaxDepth:              4,
+		MaxLeaves:             15,
+		MinChildSamples:       5,
+		Estimators:            150,
+		LearningRate:          0.1,
+		L2LeafReg:             1.0,
+		EarlyStoppingPatience: 5,
+		ValidationX:           valX,
+		ValidationY:           valY,
+	}
+	lgbTrees, _ := TrainLeafwiseGBDT(trainX, trainY, nil, lgbParams)
+	if len(lgbTrees) >= 150 {
+		t.Errorf("expected early stopping to truncate LightGBM trees before 150 iterations, got %d", len(lgbTrees))
+	}
+	if len(lgbTrees) == 0 {
+		t.Errorf("expected non-zero trees from early stopping, got 0")
+	}
+}
+
+func TestEnsemble_IntraTreeParallelism(t *testing.T) {
+	// Construct dataset with >= 16 features to engage intra-tree parallel worker pool
+	rng := rand.New(rand.NewSource(123))
+	const nSamples = 120
+	const nFeatures = 18
+
+	X := make([]FeatureVector, nSamples)
+	Y := make([]float64, nSamples)
+	for i := 0; i < nSamples; i++ {
+		vals := make([]float64, nFeatures)
+		for f := 0; f < nFeatures; f++ {
+			vals[f] = float64(i*f)*0.1 + rng.Float64()
+		}
+		X[i] = FeatureVector{Values: vals}
+		Y[i] = vals[0] + vals[10]*0.5
+	}
+
+	cbParams := CatBoostParams{
+		Depth:        4,
+		Iterations:   5,
+		LearningRate: 0.1,
+		L2LeafReg:    1.0,
+	}
+	trees, _ := TrainSymmetricGBDT(X, Y, nil, cbParams)
+	if len(trees) != 5 {
+		t.Fatalf("expected 5 trees, got %d", len(trees))
+	}
+
+	lgbParams := LightGBMParams{
+		MaxDepth:        4,
+		MaxLeaves:       15,
+		MinChildSamples: 5,
+		Estimators:      5,
+		LearningRate:    0.1,
+		L2LeafReg:       1.0,
+	}
+	lgbTrees, _ := TrainLeafwiseGBDT(X, Y, nil, lgbParams)
+	if len(lgbTrees) != 5 {
+		t.Fatalf("expected 5 leafwise trees, got %d", len(lgbTrees))
+	}
+}
+
+// FuzzEnsembleEarlyStopping fuzzes early stopping patience and arbitrary validation targets.
+func FuzzEnsembleEarlyStopping(f *testing.F) {
+	f.Add(1, float64(10.0), float64(20.0))
+	f.Add(5, float64(-50.0), float64(50.0))
+	f.Add(0, float64(0.0), float64(0.0))
+	f.Add(10, float64(1e5), float64(-1e5))
+
+	f.Fuzz(func(t *testing.T, patience int, valY0, valY1 float64) {
+		if patience < 0 || patience > 50 {
+			return
+		}
+		if math.IsNaN(valY0) || math.IsNaN(valY1) || math.IsInf(valY0, 0) || math.IsInf(valY1, 0) {
+			return
+		}
+
+		X := []FeatureVector{
+			{Values: []float64{1.0, 2.0}},
+			{Values: []float64{3.0, 4.0}},
+			{Values: []float64{5.0, 6.0}},
+			{Values: []float64{7.0, 8.0}},
+		}
+		Y := []float64{10.0, 20.0, 30.0, 40.0}
+
+		valX := []FeatureVector{
+			{Values: []float64{2.0, 3.0}},
+			{Values: []float64{6.0, 7.0}},
+		}
+		valY := []float64{valY0, valY1}
+
+		cfg := DefaultEnsembleConfig()
+		cfg.EarlyStoppingPatience = patience
+		cfg.ValidationX = valX
+		cfg.ValidationY = valY
+		cfg.CatBoost.Iterations = 5
+		cfg.LightGBM.Estimators = 5
+		cfg.ExtraTrees.Estimators = 0
+
+		model := TrainEnsembleWithWeights(X, Y, nil, cfg)
+		if model != nil {
+			pred := model.Predict([]float64{4.0, 5.0})
+			if math.IsNaN(pred) || math.IsInf(pred, 0) {
+				t.Fatalf("non-finite prediction: %f", pred)
+			}
+		}
+	})
+}
+
+// FuzzColsampleFeatureSelection fuzzes subsampling ratios with adversarial values.
+func FuzzColsampleFeatureSelection(f *testing.F) {
+	f.Add(float64(0.5), float64(0.8))
+	f.Add(float64(1.0), float64(1.0))
+	f.Add(float64(0.0), float64(0.0))
+	f.Add(float64(0.1), float64(0.1))
+
+	f.Fuzz(func(t *testing.T, colTree, colNode float64) {
+		if math.IsNaN(colTree) || math.IsNaN(colNode) || math.IsInf(colTree, 0) || math.IsInf(colNode, 0) {
+			return
+		}
+		if colTree < 0.0 || colTree > 1.0 || colNode < 0.0 || colNode > 1.0 {
+			return
+		}
+
+		X := []FeatureVector{
+			{Values: []float64{1.0, 2.0, 3.0, 4.0}},
+			{Values: []float64{2.0, 3.0, 4.0, 5.0}},
+			{Values: []float64{3.0, 4.0, 5.0, 6.0}},
+			{Values: []float64{4.0, 5.0, 6.0, 7.0}},
+		}
+		Y := []float64{1.0, 2.0, 3.0, 4.0}
+
+		cfg := DefaultEnsembleConfig()
+		cfg.ColsampleByTree = colTree
+		cfg.ColsampleByNode = colNode
+		cfg.CatBoost.Iterations = 2
+		cfg.LightGBM.Estimators = 2
+		cfg.ExtraTrees.Estimators = 0
+
+		model := TrainEnsembleWithWeights(X, Y, nil, cfg)
+		if model != nil {
+			pred := model.Predict([]float64{2.5, 3.5, 4.5, 5.5})
 			if math.IsNaN(pred) || math.IsInf(pred, 0) {
 				t.Fatalf("non-finite prediction: %f", pred)
 			}

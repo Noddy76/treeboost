@@ -462,3 +462,75 @@ func FuzzQuantizeDataset_SpecialFloats(f *testing.F) {
 		}
 	})
 }
+
+// FuzzQuantizeDataset_HistogramBinning fuzzes arbitrary continuous matrices (NaNs, Infs, extreme scales)
+// through histogram quantization and downstream split search.
+func FuzzQuantizeDataset_HistogramBinning(f *testing.F) {
+	f.Add(float64(1.0), float64(2.0), float64(3.0), float64(4.0), 32)
+	f.Add(float64(-1e300), float64(1e300), float64(0.0), float64(1e-15), 256)
+	f.Add(math.NaN(), math.Inf(1), math.Inf(-1), float64(42.0), 64)
+	f.Add(float64(0.0), float64(0.0), float64(0.0), float64(0.0), 10)
+
+	f.Fuzz(func(t *testing.T, v1, v2, v3, v4 float64, maxBins int) {
+		const nSamples = 16
+		const nFeatures = 3
+
+		if maxBins <= 0 || maxBins > 256 {
+			maxBins = 256
+		}
+
+		features := make([]float64, nSamples*nFeatures)
+		for f := 0; f < nFeatures; f++ {
+			fOffset := f * nSamples
+			for i := 0; i < nSamples; i++ {
+				switch (f + i) % 4 {
+				case 0:
+					features[fOffset+i] = v1
+				case 1:
+					features[fOffset+i] = v2
+				case 2:
+					features[fOffset+i] = v3
+				case 3:
+					features[fOffset+i] = v4
+				}
+			}
+		}
+
+		targets := make([]float64, nSamples)
+		weights := make([]float64, nSamples)
+		sampleIdxs := make([]int, nSamples)
+		for i := 0; i < nSamples; i++ {
+			targets[i] = float64(i * 2)
+			weights[i] = 1.0 + float64(i%3)
+			sampleIdxs[i] = i
+		}
+
+		cd := ColumnarDataset{
+			NumSamples:  nSamples,
+			NumFeatures: nFeatures,
+			Features:    features,
+			Targets:     targets,
+			Weights:     weights,
+		}
+
+		binned := QuantizeDataset(cd, maxBins)
+		if binned.NumSamples != nSamples || binned.NumFeatures != nFeatures {
+			t.Fatalf("quantized dataset dimensions mismatch")
+		}
+
+		var hist FeatureHistogram
+		for feat := 0; feat < nFeatures; feat++ {
+			fOffset := feat * nSamples
+			BuildHistogramSlice(binned.Bins, fOffset, cd.Weights, cd.Targets, sampleIdxs, 0, nSamples, &hist)
+			splitVal, score, ok := FindBestHistogramSplit(&hist, binned.BinBoundaries[feat], 20.0, 40.0)
+			if ok {
+				if math.IsNaN(splitVal) || math.IsInf(splitVal, 0) {
+					t.Fatalf("non-finite splitVal: %f", splitVal)
+				}
+				if math.IsNaN(score) || math.IsInf(score, 0) {
+					t.Fatalf("non-finite score: %f", score)
+				}
+			}
+		}
+	})
+}

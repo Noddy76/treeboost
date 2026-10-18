@@ -43,6 +43,9 @@ fuzz:
 	go test -fuzz=FuzzWeightedQuantile -fuzztime=$(FUZZTIME) .
 	go test -fuzz=FuzzPinballLoss -fuzztime=$(FUZZTIME) .
 	go test -fuzz=FuzzTrainQuantileEnsemble -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzQuantizeDataset_HistogramBinning -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzEnsembleEarlyStopping -fuzztime=$(FUZZTIME) .
+	go test -fuzz=FuzzColsampleFeatureSelection -fuzztime=$(FUZZTIME) .
 
 generate:
 	go generate ./...

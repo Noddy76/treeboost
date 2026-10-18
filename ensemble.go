@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -51,27 +52,41 @@ func clampLeafValue(val float64, maxLeaf float64) float64 {
 // CatBoostParams holds hyperparameters for Symmetric GBDT (obliviated trees).
 // Reference: https://en.wikipedia.org/wiki/CatBoost
 type CatBoostParams struct {
-	Depth        int     `json:"depth"`
-	Iterations   int     `json:"iterations"`
-	LearningRate float64 `json:"learning_rate"`
-	L2LeafReg    float64 `json:"l2_leaf_reg"`
-	MaxLeafValue float64 `json:"max_leaf_value,omitempty"`
-	LossFunction string  `json:"loss_function,omitempty"`
-	Quantile     float64 `json:"quantile,omitempty"`
+	Depth                 int             `json:"depth"`
+	Iterations            int             `json:"iterations"`
+	LearningRate          float64         `json:"learning_rate"`
+	L2LeafReg             float64         `json:"l2_leaf_reg"`
+	MaxLeafValue          float64         `json:"max_leaf_value,omitempty"`
+	LossFunction          string          `json:"loss_function,omitempty"`
+	Quantile              float64         `json:"quantile,omitempty"`
+	ColsampleByTree       float64         `json:"colsample_bytree,omitempty"`
+	ColsampleByNode       float64         `json:"colsample_bynode,omitempty"`
+	EarlyStoppingPatience int             `json:"early_stopping_patience,omitempty"`
+	ValidationData        ColumnarDataset `json:"-"`
+	ValidationX           []FeatureVector `json:"-"`
+	ValidationY           []float64       `json:"-"`
+	ValidationW           []float64       `json:"-"`
 }
 
 // LightGBMParams holds hyperparameters for Leaf-wise GBDT (best-first tree growth).
 // Reference: https://en.wikipedia.org/wiki/LightGBM
 type LightGBMParams struct {
-	MaxDepth        int     `json:"max_depth"`
-	MaxLeaves       int     `json:"max_leaves"`
-	MinChildSamples int     `json:"min_child_samples"`
-	Estimators      int     `json:"estimators"`
-	LearningRate    float64 `json:"learning_rate"`
-	L2LeafReg       float64 `json:"l2_leaf_reg"` // L2 leaf regularization parameter (lambda >= 0.0)
-	MaxLeafValue    float64 `json:"max_leaf_value,omitempty"`
-	LossFunction    string  `json:"loss_function,omitempty"`
-	Quantile        float64 `json:"quantile,omitempty"`
+	MaxDepth              int             `json:"max_depth"`
+	MaxLeaves             int             `json:"max_leaves"`
+	MinChildSamples       int             `json:"min_child_samples"`
+	Estimators            int             `json:"estimators"`
+	LearningRate          float64         `json:"learning_rate"`
+	L2LeafReg             float64         `json:"l2_leaf_reg"` // L2 leaf regularization parameter (lambda >= 0.0)
+	MaxLeafValue          float64         `json:"max_leaf_value,omitempty"`
+	LossFunction          string          `json:"loss_function,omitempty"`
+	Quantile              float64         `json:"quantile,omitempty"`
+	ColsampleByTree       float64         `json:"colsample_bytree,omitempty"`
+	ColsampleByNode       float64         `json:"colsample_bynode,omitempty"`
+	EarlyStoppingPatience int             `json:"early_stopping_patience,omitempty"`
+	ValidationData        ColumnarDataset `json:"-"`
+	ValidationX           []FeatureVector `json:"-"`
+	ValidationY           []float64       `json:"-"`
+	ValidationW           []float64       `json:"-"`
 }
 
 // ExtraTreesParams holds hyperparameters for Extremely Randomized Trees.
@@ -87,15 +102,22 @@ type ExtraTreesParams struct {
 
 // EnsembleConfig specifies individual algorithm parameters and weighted contribution ratios.
 type EnsembleConfig struct {
-	MaxLeafValue     float64          `json:"max_leaf_value,omitempty"`
-	CatBoostWeight   float64          `json:"catboost_weight"`
-	LightGBMWeight   float64          `json:"lightgbm_weight"`
-	ExtraTreesWeight float64          `json:"extratrees_weight"`
-	LossFunction     string           `json:"loss_function,omitempty"`
-	Quantile         float64          `json:"quantile,omitempty"`
-	CatBoost         CatBoostParams   `json:"catboost"`
-	LightGBM         LightGBMParams   `json:"lightgbm"`
-	ExtraTrees       ExtraTreesParams `json:"extratrees"`
+	MaxLeafValue          float64          `json:"max_leaf_value,omitempty"`
+	CatBoostWeight        float64          `json:"catboost_weight"`
+	LightGBMWeight        float64          `json:"lightgbm_weight"`
+	ExtraTreesWeight      float64          `json:"extratrees_weight"`
+	LossFunction          string           `json:"loss_function,omitempty"`
+	Quantile              float64          `json:"quantile,omitempty"`
+	ColsampleByTree       float64          `json:"colsample_bytree,omitempty"`
+	ColsampleByNode       float64          `json:"colsample_bynode,omitempty"`
+	EarlyStoppingPatience int              `json:"early_stopping_patience,omitempty"`
+	ValidationData        ColumnarDataset  `json:"-"`
+	ValidationX           []FeatureVector  `json:"-"`
+	ValidationY           []float64        `json:"-"`
+	ValidationW           []float64        `json:"-"`
+	CatBoost              CatBoostParams   `json:"catboost"`
+	LightGBM              LightGBMParams   `json:"lightgbm"`
+	ExtraTrees            ExtraTreesParams `json:"extratrees"`
 }
 
 // DefaultEnsembleConfig returns a balanced, standard default configuration combining
@@ -161,6 +183,8 @@ type TrainWorkspace struct {
 	Ranges          []nodeRange
 	Hist            FeatureHistogram
 	QuantileScratch []int
+	TreeFeatureIdxs []int
+	NodeFeatureIdxs []int
 }
 
 var trainWorkspacePool = sync.Pool{
@@ -171,6 +195,8 @@ var trainWorkspacePool = sync.Pool{
 			SplitBuf:        make([]float64, 50),
 			Ranges:          make([]nodeRange, 0, 256),
 			QuantileScratch: make([]int, 0, 4096),
+			TreeFeatureIdxs: make([]int, 0, 256),
+			NodeFeatureIdxs: make([]int, 0, 256),
 		}
 	},
 }
@@ -203,6 +229,16 @@ func acquireWorkspace(nSamples, nFeatures int) *TrainWorkspace {
 	} else {
 		ws.QuantileScratch = ws.QuantileScratch[:0]
 	}
+	if cap(ws.TreeFeatureIdxs) < nFeatures {
+		ws.TreeFeatureIdxs = make([]int, nFeatures)
+	} else {
+		ws.TreeFeatureIdxs = ws.TreeFeatureIdxs[:nFeatures]
+	}
+	if cap(ws.NodeFeatureIdxs) < nFeatures {
+		ws.NodeFeatureIdxs = make([]int, nFeatures)
+	} else {
+		ws.NodeFeatureIdxs = ws.NodeFeatureIdxs[:nFeatures]
+	}
 	return ws
 }
 
@@ -211,6 +247,74 @@ func releaseWorkspace(ws *TrainWorkspace) {
 		return
 	}
 	trainWorkspacePool.Put(ws)
+}
+
+// validateColsample ensures colsample ratios are strictly valid numbers in [0.0, 1.0].
+func validateColsample(name string, val float64) {
+	if math.IsNaN(val) || math.IsInf(val, 0) || val < 0.0 || val > 1.0 {
+		panic(fmt.Sprintf("treeboost: invalid %s %v; must be finite and in [0.0, 1.0]", name, val))
+	}
+}
+
+// resolveColsample returns 1.0 if val is 0.0 (or default), validating bounds.
+func resolveColsample(name string, val float64) float64 {
+	validateColsample(name, val)
+	if val <= 0.0 {
+		return 1.0
+	}
+	return val
+}
+
+// validateEarlyStopping ensures patience is non-negative.
+func validateEarlyStopping(patience int) {
+	if patience < 0 {
+		panic(fmt.Sprintf("treeboost: invalid early stopping patience %d; must be >= 0", patience))
+	}
+}
+
+// sampleFeatures selects a subset of features from source without heap allocations.
+// If ratio >= 1.0 or source has length <= 1, all source features are copied to dest.
+// Otherwise, exactly ceil(ratio * len(source)) unique features are selected using Fisher-Yates shuffle.
+func sampleFeatures(source []int, ratio float64, dest []int, permBuf []int, rng *rand.Rand) []int {
+	n := len(source)
+	if n == 0 {
+		return dest[:0]
+	}
+	if ratio >= 1.0 || ratio <= 0.0 {
+		if cap(dest) < n {
+			dest = make([]int, n)
+		} else {
+			dest = dest[:n]
+		}
+		copy(dest, source)
+		return dest
+	}
+	k := int(math.Ceil(ratio * float64(n)))
+	if k < 1 {
+		k = 1
+	}
+	if k > n {
+		k = n
+	}
+	if cap(permBuf) < n {
+		permBuf = make([]int, n)
+	} else {
+		permBuf = permBuf[:n]
+	}
+	copy(permBuf, source)
+
+	// Partial Fisher-Yates shuffle of permBuf up to k elements
+	for i := 0; i < k; i++ {
+		j := i + rng.Intn(n-i)
+		permBuf[i], permBuf[j] = permBuf[j], permBuf[i]
+	}
+	if cap(dest) < k {
+		dest = make([]int, k)
+	} else {
+		dest = dest[:k]
+	}
+	copy(dest, permBuf[:k])
+	return dest
 }
 
 // partitionSamplesInPlace partitions sampleIdxs[start:end] in-place around splitVal for feature f.
@@ -293,7 +397,91 @@ func computeWeightedError(Y []float64, W []float64, indices []int) (float64, flo
 	return errorSq, mean, sumW
 }
 
-func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64) []Node {
+type splitCandidateResult struct {
+	feature int
+	val     float64
+	score   float64
+}
+
+func evaluateSymmetricFeatureSplits(
+	data ColumnarDataset,
+	f int,
+	levelStart, levelEnd int,
+	ranges []nodeRange,
+	sampleIdxs []int,
+	ws *TrainWorkspace,
+) splitCandidateResult {
+	res := splitCandidateResult{feature: -1, val: 0.0, score: math.MaxFloat64}
+	fOffset := f * data.NumSamples
+
+	var candidates []float64
+	if len(data.Binned.Bins) > 0 {
+		BuildHistogramSlice(data.Binned.Bins, fOffset, data.Weights, data.Targets, sampleIdxs, 0, data.NumSamples, &ws.Hist)
+		totalW, totalWY := computeWeightedSumContiguous(data.Weights, data.Targets)
+		val, _, ok := FindBestHistogramSplit(&ws.Hist, data.Binned.BinBoundaries[f], totalW, totalWY)
+		if ok {
+			candidates = []float64{val}
+		}
+	} else {
+		candidates = getSplitCandidatesColumnar(data, sampleIdxs[:data.NumSamples], f, ws)
+	}
+	if len(candidates) == 0 {
+		return res
+	}
+
+	for _, val := range candidates {
+		var totalScore float64
+		for nIdx := levelStart; nIdx < levelEnd; nIdx++ {
+			r := ranges[nIdx]
+			if r.end-r.start == 0 {
+				continue
+			}
+			var sumWLeft, sumWYLeft, sumWY2Left float64
+			var sumWRight, sumWYRight, sumWY2Right float64
+			for i := r.start; i < r.end; i++ {
+				idx := sampleIdxs[i]
+				w := data.Weights[idx]
+				y := data.Targets[idx]
+				if data.Features[fOffset+idx] < val {
+					sumWLeft += w
+					sumWYLeft += w * y
+					sumWY2Left += w * y * y
+				} else {
+					sumWRight += w
+					sumWYRight += w * y
+					sumWY2Right += w * y * y
+				}
+			}
+			var errLeft, errRight float64
+			if sumWLeft > 1e-9 {
+				errLeft = sumWY2Left - (sumWYLeft*sumWYLeft)/sumWLeft
+				if errLeft < 0 || math.IsNaN(errLeft) || math.IsInf(errLeft, 0) {
+					errLeft = 0
+				}
+			}
+			if sumWRight > 1e-9 {
+				errRight = sumWY2Right - (sumWYRight*sumWYRight)/sumWRight
+				if errRight < 0 || math.IsNaN(errRight) || math.IsInf(errRight, 0) {
+					errRight = 0
+				}
+			}
+			totalScore += errLeft + errRight
+		}
+
+		if math.IsNaN(totalScore) || math.IsInf(totalScore, 0) {
+			continue
+		}
+
+		if totalScore < res.score {
+			res.score = totalScore
+			res.feature = f
+			res.val = val
+		}
+	}
+	return res
+}
+
+func trainSymmetricTreeColumnarWithColsample(ws *TrainWorkspace, data ColumnarDataset, depth int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64, colsampleByNode float64, treeFeatures []int, rng *rand.Rand) []Node {
 	if depth < 0 {
 		depth = 0
 	} else if depth > 16 {
@@ -326,80 +514,92 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 	}
 	ws.Ranges[0] = nodeRange{start: 0, end: data.NumSamples}
 
+	// Prepare tree-level feature candidates
+	activeFeatures := treeFeatures
+	if len(activeFeatures) == 0 {
+		if cap(ws.PermBuf) < data.NumFeatures {
+			ws.PermBuf = make([]int, data.NumFeatures)
+		} else {
+			ws.PermBuf = ws.PermBuf[:data.NumFeatures]
+		}
+		for i := 0; i < data.NumFeatures; i++ {
+			ws.PermBuf[i] = i
+		}
+		activeFeatures = ws.PermBuf
+	}
+
 	actualDepth := depth
 	for d := 0; d < depth; d++ {
 		levelStart := (1 << d) - 1
 		levelEnd := (1 << (d + 1)) - 1
 
+		// Subsample features per node/level if colsampleByNode < 1.0
+		evalFeatures := activeFeatures
+		if colsampleByNode > 0.0 && colsampleByNode < 1.0 && rng != nil {
+			evalFeatures = sampleFeatures(activeFeatures, colsampleByNode, ws.NodeFeatureIdxs, ws.PermBuf, rng)
+		}
+
 		bestFeature := -1
 		bestVal := 0.0
 		bestScore := math.MaxFloat64
 
-		for f := 0; f < data.NumFeatures; f++ {
-			fOffset := f * data.NumSamples
-
-			var candidates []float64
-			if len(data.Binned.Bins) > 0 {
-				BuildHistogramSlice(data.Binned.Bins, fOffset, data.Weights, data.Targets, ws.SampleIdxs, 0, data.NumSamples, &ws.Hist)
-				totalW, totalWY := computeWeightedSumContiguous(data.Weights, data.Targets)
-				val, _, ok := FindBestHistogramSplit(&ws.Hist, data.Binned.BinBoundaries[f], totalW, totalWY)
-				if ok {
-					candidates = []float64{val}
-				}
-			} else {
-				candidates = getSplitCandidatesColumnar(data, ws.SampleIdxs[:data.NumSamples], f, ws)
+		numFeatures := len(evalFeatures)
+		concurrency := runtime.GOMAXPROCS(0)
+		if numFeatures >= 8 && concurrency > 1 {
+			// Intra-tree parallel split search across features
+			numWorkers := concurrency
+			if numWorkers > numFeatures {
+				numWorkers = numFeatures
 			}
-			if len(candidates) == 0 {
-				continue
-			}
+			chunkSize := (numFeatures + numWorkers - 1) / numWorkers
+			results := make([]splitCandidateResult, numWorkers)
+			var wg sync.WaitGroup
 
-			for _, val := range candidates {
-				var totalScore float64
-				for nIdx := levelStart; nIdx < levelEnd; nIdx++ {
-					r := ws.Ranges[nIdx]
-					if r.end-r.start == 0 {
-						continue
-					}
-					var sumWLeft, sumWYLeft, sumWY2Left float64
-					var sumWRight, sumWYRight, sumWY2Right float64
-					for i := r.start; i < r.end; i++ {
-						idx := ws.SampleIdxs[i]
-						w := data.Weights[idx]
-						y := data.Targets[idx]
-						if data.Features[fOffset+idx] < val {
-							sumWLeft += w
-							sumWYLeft += w * y
-							sumWY2Left += w * y * y
-						} else {
-							sumWRight += w
-							sumWYRight += w * y
-							sumWY2Right += w * y * y
-						}
-					}
-					var errLeft, errRight float64
-					if sumWLeft > 1e-9 {
-						errLeft = sumWY2Left - (sumWYLeft*sumWYLeft)/sumWLeft
-						if errLeft < 0 || math.IsNaN(errLeft) || math.IsInf(errLeft, 0) {
-							errLeft = 0
-						}
-					}
-					if sumWRight > 1e-9 {
-						errRight = sumWY2Right - (sumWYRight*sumWYRight)/sumWRight
-						if errRight < 0 || math.IsNaN(errRight) || math.IsInf(errRight, 0) {
-							errRight = 0
-						}
-					}
-					totalScore += errLeft + errRight
-				}
-
-				if math.IsNaN(totalScore) || math.IsInf(totalScore, 0) {
+			for w := 0; w < numWorkers; w++ {
+				fStart := w * chunkSize
+				fEnd := fStart + chunkSize
+				if fStart >= numFeatures {
+					results[w] = splitCandidateResult{feature: -1, score: math.MaxFloat64}
 					continue
 				}
+				if fEnd > numFeatures {
+					fEnd = numFeatures
+				}
 
-				if totalScore < bestScore {
-					bestScore = totalScore
-					bestFeature = f
-					bestVal = val
+				wg.Add(1)
+				go func(workerID, startIdx, endIdx int) {
+					defer wg.Done()
+					tws := acquireWorkspace(data.NumSamples, data.NumFeatures)
+					defer releaseWorkspace(tws)
+
+					workerBest := splitCandidateResult{feature: -1, score: math.MaxFloat64}
+					for idx := startIdx; idx < endIdx; idx++ {
+						feat := evalFeatures[idx]
+						candRes := evaluateSymmetricFeatureSplits(data, feat, levelStart, levelEnd, ws.Ranges, ws.SampleIdxs, tws)
+						if candRes.feature != -1 && candRes.score < workerBest.score {
+							workerBest = candRes
+						}
+					}
+					results[workerID] = workerBest
+				}(w, fStart, fEnd)
+			}
+			wg.Wait()
+
+			for _, res := range results {
+				if res.feature != -1 && res.score < bestScore {
+					bestScore = res.score
+					bestFeature = res.feature
+					bestVal = res.val
+				}
+			}
+		} else {
+			// Sequential evaluation on caller's workspace
+			for _, f := range evalFeatures {
+				candRes := evaluateSymmetricFeatureSplits(data, f, levelStart, levelEnd, ws.Ranges, ws.SampleIdxs, ws)
+				if candRes.feature != -1 && candRes.score < bestScore {
+					bestScore = candRes.score
+					bestFeature = candRes.feature
+					bestVal = candRes.val
 				}
 			}
 		}
@@ -491,9 +691,64 @@ func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth 
 	return nodes
 }
 
+func trainSymmetricTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, depth int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64) []Node {
+	return trainSymmetricTreeColumnarWithColsample(ws, data, depth, lambda, maxLeaf, lossFunction, quantile, residuals, 1.0, nil, nil)
+}
+
 func trainSymmetricTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, depth int, lambda float64, maxLeaf float64) []Node {
 	data := ToColumnar(X, Y, W)
 	return trainSymmetricTreeColumnar(ws, data, depth, lambda, maxLeaf, "", 0.0, nil)
+}
+
+// resolveValidationColumnar prepares a validation ColumnarDataset from either params.ValidationData or params.ValidationX/Y/W.
+func resolveValidationColumnar(data ColumnarDataset, valData ColumnarDataset, valX []FeatureVector, valY []float64, valW []float64) ColumnarDataset {
+	if valData.NumSamples > 0 && len(valData.Targets) == valData.NumSamples {
+		if len(valData.Weights) == 0 {
+			weights := make([]float64, valData.NumSamples)
+			for i := range weights {
+				weights[i] = 1.0
+			}
+			valData.Weights = weights
+		}
+		return valData
+	}
+	if len(valX) > 0 && len(valY) == len(valX) {
+		vd := ToColumnar(valX, valY, valW)
+		if len(vd.Weights) == 0 && vd.NumSamples > 0 {
+			weights := make([]float64, vd.NumSamples)
+			for i := range weights {
+				weights[i] = 1.0
+			}
+			vd.Weights = weights
+		}
+		return vd
+	}
+	return ColumnarDataset{NumSamples: 0}
+}
+
+// computeValidationLoss evaluates either Pinball loss or MSE over validation predictions.
+func computeValidationLoss(valData ColumnarDataset, preds []float64, isPinball bool, quantile float64) float64 {
+	n := valData.NumSamples
+	if n == 0 || len(preds) != n {
+		return 0.0
+	}
+	if isPinball {
+		return PinballLoss(valData.Targets, preds, valData.Weights, quantile)
+	}
+	var totalW, sse float64
+	for i := 0; i < n; i++ {
+		w := 1.0
+		if len(valData.Weights) > i {
+			w = valData.Weights[i]
+		}
+		diff := valData.Targets[i] - preds[i]
+		sse += w * diff * diff
+		totalW += w
+	}
+	if totalW <= 1e-9 {
+		return 0.0
+	}
+	return sse / totalW
 }
 
 // TrainSymmetricGBDTColumnar fits a CatBoost-style GBDT on ColumnarDataset without per-iteration conversions.
@@ -501,6 +756,10 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 	if params.LossFunction == LossPinball {
 		validateQuantileParams(params.LossFunction, params.Quantile)
 	}
+	validateEarlyStopping(params.EarlyStoppingPatience)
+	colsampleByTree := resolveColsample("colsample_bytree", params.ColsampleByTree)
+	colsampleByNode := resolveColsample("colsample_bynode", params.ColsampleByNode)
+
 	n := data.NumSamples
 	if n == 0 {
 		return nil, 0.0
@@ -534,6 +793,22 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 		return nil, baseValue
 	}
 
+	valData := resolveValidationColumnar(data, params.ValidationData, params.ValidationX, params.ValidationY, params.ValidationW)
+	useEarlyStopping := params.EarlyStoppingPatience > 0 && valData.NumSamples > 0
+
+	var valPreds []float64
+	bestValLoss := math.MaxFloat64
+	bestIter := -1
+	patienceCount := 0
+
+	if useEarlyStopping {
+		valPreds = make([]float64, valData.NumSamples)
+		for i := 0; i < valData.NumSamples; i++ {
+			valPreds[i] = baseValue
+		}
+		bestValLoss = computeValidationLoss(valData, valPreds, params.LossFunction == LossPinball, params.Quantile)
+	}
+
 	preds := make([]float64, n)
 	for i := 0; i < n; i++ {
 		preds[i] = baseValue
@@ -549,6 +824,12 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 
 	ws := acquireWorkspace(data.NumSamples, data.NumFeatures)
 	defer releaseWorkspace(ws)
+
+	rng := rand.New(rand.NewSource(42))
+	allFeatures := make([]int, data.NumFeatures)
+	for i := 0; i < data.NumFeatures; i++ {
+		allFeatures[i] = i
+	}
 
 	iterData := data
 	for m := 0; m < params.Iterations; m++ {
@@ -572,11 +853,37 @@ func TrainSymmetricGBDTColumnar(data ColumnarDataset, params CatBoostParams) ([]
 			iterData.Targets = residuals
 		}
 
-		treeNodes := trainSymmetricTreeColumnar(ws, iterData, params.Depth, params.L2LeafReg, maxLeaf, params.LossFunction, params.Quantile, residuals)
+		// Feature subsampling per tree
+		treeFeatures := allFeatures
+		if colsampleByTree > 0.0 && colsampleByTree < 1.0 {
+			treeFeatures = sampleFeatures(allFeatures, colsampleByTree, ws.TreeFeatureIdxs, ws.PermBuf, rng)
+		}
+
+		treeNodes := trainSymmetricTreeColumnarWithColsample(ws, iterData, params.Depth, params.L2LeafReg, maxLeaf, params.LossFunction, params.Quantile, residuals, colsampleByNode, treeFeatures, rng)
 		trees = append(trees, Tree{Nodes: treeNodes})
 
 		for i := 0; i < n; i++ {
 			preds[i] += params.LearningRate * EvaluateTreeColumnar(treeNodes, iterData, i)
+		}
+
+		if useEarlyStopping {
+			for i := 0; i < valData.NumSamples; i++ {
+				valPreds[i] += params.LearningRate * EvaluateTreeColumnar(treeNodes, valData, i)
+			}
+			valLoss := computeValidationLoss(valData, valPreds, isPinball, params.Quantile)
+			if valLoss < bestValLoss-1e-12 {
+				bestValLoss = valLoss
+				bestIter = m
+				patienceCount = 0
+			} else {
+				patienceCount++
+				if patienceCount >= params.EarlyStoppingPatience {
+					if bestIter >= 0 {
+						trees = trees[:bestIter+1]
+					}
+					break
+				}
+			}
 		}
 	}
 
@@ -609,7 +916,131 @@ type lgbBuildNode struct {
 	sumWY        float64
 }
 
-func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64) []Node {
+type leafwiseSplitCandidateResult struct {
+	gain      float64
+	activeIdx int
+	feature   int
+	val       float64
+	leftMean  float64
+	rightMean float64
+	leftW     float64
+	leftWY    float64
+	rightW    float64
+	rightWY   float64
+}
+
+func evaluateLeafwiseFeatureSplits(
+	data ColumnarDataset,
+	f int,
+	activeLeaves []int,
+	buildNodes []lgbBuildNode,
+	sampleIdxs []int,
+	maxDepth int,
+	minChildSamples int,
+	lambda float64,
+	maxLeaf float64,
+	ws *TrainWorkspace,
+) leafwiseSplitCandidateResult {
+	res := leafwiseSplitCandidateResult{gain: -1.0, activeIdx: -1, feature: -1}
+	fOffset := f * data.NumSamples
+
+	for i, nodeIdx := range activeLeaves {
+		leaf := &buildNodes[nodeIdx]
+		nSamples := leaf.end - leaf.start
+		if leaf.depth >= maxDepth || nSamples < minChildSamples*2 {
+			continue
+		}
+
+		if len(data.Binned.Bins) > 0 {
+			BuildHistogramSlice(data.Binned.Bins, fOffset, data.Weights, data.Targets, sampleIdxs, leaf.start, leaf.end, &ws.Hist)
+			val, _, leftW, leftWY, rightW, rightWY, ok := FindBestHistogramSplitWithCounts(
+				&ws.Hist, data.Binned.BinBoundaries[f], leaf.sumW, leaf.sumWY, nSamples, minChildSamples)
+			if !ok {
+				continue
+			}
+
+			parentGain := 0.0
+			if leaf.sumW+lambda > 1e-9 {
+				parentGain = (leaf.sumWY * leaf.sumWY) / (leaf.sumW + lambda)
+			}
+			gain := (leftWY*leftWY/(leftW+lambda) + rightWY*rightWY/(rightW+lambda)) - parentGain
+			if math.IsNaN(gain) || math.IsInf(gain, 0) {
+				continue
+			}
+
+			if gain > res.gain {
+				res.gain = gain
+				res.activeIdx = i
+				res.feature = f
+				res.val = val
+				res.leftMean = clampLeafValue(leftWY/(leftW+lambda), maxLeaf)
+				res.rightMean = clampLeafValue(rightWY/(rightW+lambda), maxLeaf)
+				res.leftW = leftW
+				res.leftWY = leftWY
+				res.rightW = rightW
+				res.rightWY = rightWY
+			}
+		} else {
+			candidates := getSplitCandidatesColumnar(data, sampleIdxs[leaf.start:leaf.end], f, ws)
+			if len(candidates) == 0 {
+				continue
+			}
+
+			for _, val := range candidates {
+				var sumWLeft, sumWYLeft, sumWY2Left float64
+				var sumWRight, sumWYRight, sumWY2Right float64
+				var countLeft, countRight int
+				for s := leaf.start; s < leaf.end; s++ {
+					idx := sampleIdxs[s]
+					w := data.Weights[idx]
+					y := data.Targets[idx]
+					if data.Features[fOffset+idx] < val {
+						sumWLeft += w
+						sumWYLeft += w * y
+						sumWY2Left += w * y * y
+						countLeft++
+					} else {
+						sumWRight += w
+						sumWYRight += w * y
+						sumWY2Right += w * y * y
+						countRight++
+					}
+				}
+				if countLeft < minChildSamples || countRight < minChildSamples {
+					continue
+				}
+				if sumWLeft <= 1e-9 || sumWRight <= 1e-9 {
+					continue
+				}
+
+				parentGain := 0.0
+				if leaf.sumW+lambda > 1e-9 {
+					parentGain = (leaf.sumWY * leaf.sumWY) / (leaf.sumW + lambda)
+				}
+				gain := (sumWYLeft*sumWYLeft/(sumWLeft+lambda) + sumWYRight*sumWYRight/(sumWRight+lambda)) - parentGain
+				if math.IsNaN(gain) || math.IsInf(gain, 0) {
+					continue
+				}
+
+				if gain > res.gain {
+					res.gain = gain
+					res.activeIdx = i
+					res.feature = f
+					res.val = val
+					res.leftMean = clampLeafValue(sumWYLeft/(sumWLeft+lambda), maxLeaf)
+					res.rightMean = clampLeafValue(sumWYRight/(sumWRight+lambda), maxLeaf)
+					res.leftW = sumWLeft
+					res.leftWY = sumWYLeft
+					res.rightW = sumWRight
+					res.rightWY = sumWYRight
+				}
+			}
+		}
+	}
+	return res
+}
+
+func trainLeafwiseTreeColumnarWithColsample(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64, colsampleByNode float64, treeFeatures []int, rng *rand.Rand) []Node {
 	if maxDepth < 0 {
 		maxDepth = 0
 	}
@@ -663,7 +1094,27 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 
 	activeLeaves := []int{0}
 
+	// Prepare tree-level feature candidates
+	activeFeatures := treeFeatures
+	if len(activeFeatures) == 0 {
+		if cap(ws.PermBuf) < data.NumFeatures {
+			ws.PermBuf = make([]int, data.NumFeatures)
+		} else {
+			ws.PermBuf = ws.PermBuf[:data.NumFeatures]
+		}
+		for i := 0; i < data.NumFeatures; i++ {
+			ws.PermBuf[i] = i
+		}
+		activeFeatures = ws.PermBuf
+	}
+
 	for len(activeLeaves) < maxLeaves {
+		// Subsample features per node split if colsampleByNode < 1.0
+		evalFeatures := activeFeatures
+		if colsampleByNode > 0.0 && colsampleByNode < 1.0 && rng != nil {
+			evalFeatures = sampleFeatures(activeFeatures, colsampleByNode, ws.NodeFeatureIdxs, ws.PermBuf, rng)
+		}
+
 		bestActiveIdx := -1
 		bestGain := -1.0
 		bestF := -1
@@ -671,99 +1122,83 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 		var bestLeftMean, bestRightMean float64
 		var bestLeftW, bestLeftWY, bestRightW, bestRightWY float64
 
-		for i, nodeIdx := range activeLeaves {
-			leaf := &buildNodes[nodeIdx]
-			nSamples := leaf.end - leaf.start
-			if leaf.depth >= maxDepth || nSamples < minChildSamples*2 {
-				continue
+		numFeatures := len(evalFeatures)
+		concurrency := runtime.GOMAXPROCS(0)
+		if numFeatures >= 8 && concurrency > 1 {
+			// Intra-tree parallel split search across features
+			numWorkers := concurrency
+			if numWorkers > numFeatures {
+				numWorkers = numFeatures
 			}
+			chunkSize := (numFeatures + numWorkers - 1) / numWorkers
+			results := make([]leafwiseSplitCandidateResult, numWorkers)
+			var wg sync.WaitGroup
 
-			for f := 0; f < data.NumFeatures; f++ {
-				fOffset := f * data.NumSamples
-				if len(data.Binned.Bins) > 0 {
-					BuildHistogramSlice(data.Binned.Bins, fOffset, data.Weights, data.Targets, ws.SampleIdxs, leaf.start, leaf.end, &ws.Hist)
-					val, _, leftW, leftWY, rightW, rightWY, ok := FindBestHistogramSplitWithCounts(
-						&ws.Hist, data.Binned.BinBoundaries[f], leaf.sumW, leaf.sumWY, nSamples, minChildSamples)
-					if !ok {
-						continue
-					}
+			for w := 0; w < numWorkers; w++ {
+				fStart := w * chunkSize
+				fEnd := fStart + chunkSize
+				if fStart >= numFeatures {
+					results[w] = leafwiseSplitCandidateResult{gain: -1.0, activeIdx: -1, feature: -1}
+					continue
+				}
+				if fEnd > numFeatures {
+					fEnd = numFeatures
+				}
 
-					parentGain := 0.0
-					if leaf.sumW+lambda > 1e-9 {
-						parentGain = (leaf.sumWY * leaf.sumWY) / (leaf.sumW + lambda)
-					}
-					gain := (leftWY*leftWY/(leftW+lambda) + rightWY*rightWY/(rightW+lambda)) - parentGain
-					if math.IsNaN(gain) || math.IsInf(gain, 0) {
-						continue
-					}
+				wg.Add(1)
+				go func(workerID, startIdx, endIdx int) {
+					defer wg.Done()
+					tws := acquireWorkspace(data.NumSamples, data.NumFeatures)
+					defer releaseWorkspace(tws)
 
-					if gain > bestGain {
-						bestGain = gain
-						bestActiveIdx = i
-						bestF = f
-						bestVal = val
-						bestLeftMean = clampLeafValue(leftWY/(leftW+lambda), maxLeaf)
-						bestRightMean = clampLeafValue(rightWY/(rightW+lambda), maxLeaf)
-						bestLeftW = leftW
-						bestLeftWY = leftWY
-						bestRightW = rightW
-						bestRightWY = rightWY
-					}
-				} else {
-					candidates := getSplitCandidatesColumnar(data, ws.SampleIdxs[leaf.start:leaf.end], f, ws)
-					if len(candidates) == 0 {
-						continue
-					}
-
-					for _, val := range candidates {
-						var sumWLeft, sumWYLeft, sumWY2Left float64
-						var sumWRight, sumWYRight, sumWY2Right float64
-						var countLeft, countRight int
-						for s := leaf.start; s < leaf.end; s++ {
-							idx := ws.SampleIdxs[s]
-							w := data.Weights[idx]
-							y := data.Targets[idx]
-							if data.Features[fOffset+idx] < val {
-								sumWLeft += w
-								sumWYLeft += w * y
-								sumWY2Left += w * y * y
-								countLeft++
-							} else {
-								sumWRight += w
-								sumWYRight += w * y
-								sumWY2Right += w * y * y
-								countRight++
-							}
-						}
-						if countLeft < minChildSamples || countRight < minChildSamples {
-							continue
-						}
-						if sumWLeft <= 1e-9 || sumWRight <= 1e-9 {
-							continue
-						}
-
-						parentGain := 0.0
-						if leaf.sumW+lambda > 1e-9 {
-							parentGain = (leaf.sumWY * leaf.sumWY) / (leaf.sumW + lambda)
-						}
-						gain := (sumWYLeft*sumWYLeft/(sumWLeft+lambda) + sumWYRight*sumWYRight/(sumWRight+lambda)) - parentGain
-						if math.IsNaN(gain) || math.IsInf(gain, 0) {
-							continue
-						}
-
-						if gain > bestGain {
-							bestGain = gain
-							bestActiveIdx = i
-							bestF = f
-							bestVal = val
-							bestLeftMean = clampLeafValue(sumWYLeft/(sumWLeft+lambda), maxLeaf)
-							bestRightMean = clampLeafValue(sumWYRight/(sumWRight+lambda), maxLeaf)
-							bestLeftW = sumWLeft
-							bestLeftWY = sumWYLeft
-							bestRightW = sumWRight
-							bestRightWY = sumWYRight
+					workerBest := leafwiseSplitCandidateResult{gain: -1.0, activeIdx: -1, feature: -1}
+					for idx := startIdx; idx < endIdx; idx++ {
+						feat := evalFeatures[idx]
+						candRes := evaluateLeafwiseFeatureSplits(
+							data, feat, activeLeaves, buildNodes, ws.SampleIdxs,
+							maxDepth, minChildSamples, lambda, maxLeaf, tws,
+						)
+						if candRes.gain > workerBest.gain {
+							workerBest = candRes
 						}
 					}
+					results[workerID] = workerBest
+				}(w, fStart, fEnd)
+			}
+			wg.Wait()
+
+			for _, res := range results {
+				if res.gain > bestGain {
+					bestGain = res.gain
+					bestActiveIdx = res.activeIdx
+					bestF = res.feature
+					bestVal = res.val
+					bestLeftMean = res.leftMean
+					bestRightMean = res.rightMean
+					bestLeftW = res.leftW
+					bestLeftWY = res.leftWY
+					bestRightW = res.rightW
+					bestRightWY = res.rightWY
+				}
+			}
+		} else {
+			// Sequential evaluation on caller's workspace
+			for _, f := range evalFeatures {
+				candRes := evaluateLeafwiseFeatureSplits(
+					data, f, activeLeaves, buildNodes, ws.SampleIdxs,
+					maxDepth, minChildSamples, lambda, maxLeaf, ws,
+				)
+				if candRes.gain > bestGain {
+					bestGain = candRes.gain
+					bestActiveIdx = candRes.activeIdx
+					bestF = candRes.feature
+					bestVal = candRes.val
+					bestLeftMean = candRes.leftMean
+					bestRightMean = candRes.rightMean
+					bestLeftW = candRes.leftW
+					bestLeftWY = candRes.leftWY
+					bestRightW = candRes.rightW
+					bestRightWY = candRes.rightWY
 				}
 			}
 		}
@@ -856,6 +1291,10 @@ func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDept
 	return nodes
 }
 
+func trainLeafwiseTreeColumnar(ws *TrainWorkspace, data ColumnarDataset, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64, lossFunction string, quantile float64, residuals []float64) []Node {
+	return trainLeafwiseTreeColumnarWithColsample(ws, data, maxDepth, maxLeaves, minChildSamples, lambda, maxLeaf, lossFunction, quantile, residuals, 1.0, nil, nil)
+}
+
 func trainLeafwiseTree(ws *TrainWorkspace, X []FeatureVector, Y []float64, W []float64, maxDepth int, maxLeaves int, minChildSamples int, lambda float64, maxLeaf float64) []Node {
 	data := ToColumnar(X, Y, W)
 	return trainLeafwiseTreeColumnar(ws, data, maxDepth, maxLeaves, minChildSamples, lambda, maxLeaf, "", 0.0, nil)
@@ -866,6 +1305,10 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 	if params.LossFunction == LossPinball {
 		validateQuantileParams(params.LossFunction, params.Quantile)
 	}
+	validateEarlyStopping(params.EarlyStoppingPatience)
+	colsampleByTree := resolveColsample("colsample_bytree", params.ColsampleByTree)
+	colsampleByNode := resolveColsample("colsample_bynode", params.ColsampleByNode)
+
 	n := data.NumSamples
 	if n == 0 {
 		return nil, 0.0
@@ -899,6 +1342,22 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 		return nil, baseValue
 	}
 
+	valData := resolveValidationColumnar(data, params.ValidationData, params.ValidationX, params.ValidationY, params.ValidationW)
+	useEarlyStopping := params.EarlyStoppingPatience > 0 && valData.NumSamples > 0
+
+	var valPreds []float64
+	bestValLoss := math.MaxFloat64
+	bestIter := -1
+	patienceCount := 0
+
+	if useEarlyStopping {
+		valPreds = make([]float64, valData.NumSamples)
+		for i := 0; i < valData.NumSamples; i++ {
+			valPreds[i] = baseValue
+		}
+		bestValLoss = computeValidationLoss(valData, valPreds, params.LossFunction == LossPinball, params.Quantile)
+	}
+
 	preds := make([]float64, n)
 	for i := 0; i < n; i++ {
 		preds[i] = baseValue
@@ -914,6 +1373,12 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 
 	ws := acquireWorkspace(data.NumSamples, data.NumFeatures)
 	defer releaseWorkspace(ws)
+
+	rng := rand.New(rand.NewSource(42))
+	allFeatures := make([]int, data.NumFeatures)
+	for i := 0; i < data.NumFeatures; i++ {
+		allFeatures[i] = i
+	}
 
 	iterData := data
 	for m := 0; m < params.Estimators; m++ {
@@ -937,11 +1402,37 @@ func TrainLeafwiseGBDTColumnar(data ColumnarDataset, params LightGBMParams) ([]T
 			iterData.Targets = residuals
 		}
 
-		treeNodes := trainLeafwiseTreeColumnar(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples, params.L2LeafReg, maxLeaf, params.LossFunction, params.Quantile, residuals)
+		// Feature subsampling per tree
+		treeFeatures := allFeatures
+		if colsampleByTree > 0.0 && colsampleByTree < 1.0 {
+			treeFeatures = sampleFeatures(allFeatures, colsampleByTree, ws.TreeFeatureIdxs, ws.PermBuf, rng)
+		}
+
+		treeNodes := trainLeafwiseTreeColumnarWithColsample(ws, iterData, params.MaxDepth, params.MaxLeaves, params.MinChildSamples, params.L2LeafReg, maxLeaf, params.LossFunction, params.Quantile, residuals, colsampleByNode, treeFeatures, rng)
 		trees = append(trees, Tree{Nodes: treeNodes})
 
 		for i := 0; i < n; i++ {
 			preds[i] += params.LearningRate * EvaluateTreeColumnar(treeNodes, iterData, i)
+		}
+
+		if useEarlyStopping {
+			for i := 0; i < valData.NumSamples; i++ {
+				valPreds[i] += params.LearningRate * EvaluateTreeColumnar(treeNodes, valData, i)
+			}
+			valLoss := computeValidationLoss(valData, valPreds, isPinball, params.Quantile)
+			if valLoss < bestValLoss-1e-12 {
+				bestValLoss = valLoss
+				bestIter = m
+				patienceCount = 0
+			} else {
+				patienceCount++
+				if patienceCount >= params.EarlyStoppingPatience {
+					if bestIter >= 0 {
+						trees = trees[:bestIter+1]
+					}
+					break
+				}
+			}
 		}
 	}
 
@@ -1237,9 +1728,29 @@ func ScaleTreeLeavesInPlace(tree *Tree, factor float64) {
 	}
 }
 
-// TrainEnsembleWithWeights trains a multi-algorithm tree ensemble (CatBoost, LightGBM, ExtraTrees)
-// using explicit sample weights W.
 func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, config EnsembleConfig) *Model {
+	validateEarlyStopping(config.EarlyStoppingPatience)
+	validateEarlyStopping(config.CatBoost.EarlyStoppingPatience)
+	validateEarlyStopping(config.LightGBM.EarlyStoppingPatience)
+	if config.ColsampleByTree != 0.0 {
+		validateColsample("colsample_bytree", config.ColsampleByTree)
+	}
+	if config.ColsampleByNode != 0.0 {
+		validateColsample("colsample_bynode", config.ColsampleByNode)
+	}
+	if config.CatBoost.ColsampleByTree != 0.0 {
+		validateColsample("colsample_bytree", config.CatBoost.ColsampleByTree)
+	}
+	if config.CatBoost.ColsampleByNode != 0.0 {
+		validateColsample("colsample_bynode", config.CatBoost.ColsampleByNode)
+	}
+	if config.LightGBM.ColsampleByTree != 0.0 {
+		validateColsample("colsample_bytree", config.LightGBM.ColsampleByTree)
+	}
+	if config.LightGBM.ColsampleByNode != 0.0 {
+		validateColsample("colsample_bynode", config.LightGBM.ColsampleByNode)
+	}
+
 	if len(X) != len(Y) {
 		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
 	}
@@ -1278,6 +1789,43 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 	etParams := config.ExtraTrees
 	if etParams.LossFunction == LossPinball {
 		validateQuantileParams(etParams.LossFunction, etParams.Quantile)
+	}
+
+	// Propagate EnsembleConfig level colsample and early stopping parameters if not explicitly set on sub-models
+	if cbParams.ColsampleByTree <= 0.0 && config.ColsampleByTree > 0.0 {
+		cbParams.ColsampleByTree = config.ColsampleByTree
+	}
+	if cbParams.ColsampleByNode <= 0.0 && config.ColsampleByNode > 0.0 {
+		cbParams.ColsampleByNode = config.ColsampleByNode
+	}
+	if cbParams.EarlyStoppingPatience <= 0 && config.EarlyStoppingPatience > 0 {
+		cbParams.EarlyStoppingPatience = config.EarlyStoppingPatience
+	}
+	if cbParams.ValidationData.NumSamples == 0 && config.ValidationData.NumSamples > 0 {
+		cbParams.ValidationData = config.ValidationData
+	}
+	if len(cbParams.ValidationX) == 0 && len(config.ValidationX) > 0 {
+		cbParams.ValidationX = config.ValidationX
+		cbParams.ValidationY = config.ValidationY
+		cbParams.ValidationW = config.ValidationW
+	}
+
+	if lgbParams.ColsampleByTree <= 0.0 && config.ColsampleByTree > 0.0 {
+		lgbParams.ColsampleByTree = config.ColsampleByTree
+	}
+	if lgbParams.ColsampleByNode <= 0.0 && config.ColsampleByNode > 0.0 {
+		lgbParams.ColsampleByNode = config.ColsampleByNode
+	}
+	if lgbParams.EarlyStoppingPatience <= 0 && config.EarlyStoppingPatience > 0 {
+		lgbParams.EarlyStoppingPatience = config.EarlyStoppingPatience
+	}
+	if lgbParams.ValidationData.NumSamples == 0 && config.ValidationData.NumSamples > 0 {
+		lgbParams.ValidationData = config.ValidationData
+	}
+	if len(lgbParams.ValidationX) == 0 && len(config.ValidationX) > 0 {
+		lgbParams.ValidationX = config.ValidationX
+		lgbParams.ValidationY = config.ValidationY
+		lgbParams.ValidationW = config.ValidationW
 	}
 
 	data := ToColumnar(X, Y, W)
