@@ -15,6 +15,7 @@
 package treeboost
 
 import (
+	"fmt"
 	"math"
 	"sort"
 )
@@ -167,9 +168,27 @@ func BuildHistogramSlice(bins []uint8, fOffset int, weights []float64, targets [
 	}
 }
 
+// validateHistogramLambda fails fast on negative, NaN, or infinite L2 regularization.
+func validateHistogramLambda(lambda float64) {
+	if lambda < 0.0 || math.IsNaN(lambda) || math.IsInf(lambda, 0) {
+		panic(fmt.Sprintf("treeboost: invalid histogram L2 lambda %v; must be finite and >= 0", lambda))
+	}
+}
+
 // FindBestHistogramSplit scans accumulated feature histogram bins to find the split threshold
-// minimizing variance (maximizing gain).
+// minimizing variance (maximizing gain). It is equivalent to FindBestHistogramSplitReg with lambda = 0.
 func FindBestHistogramSplit(hist *FeatureHistogram, boundaries []float64, totalW, totalWY float64) (float64, float64, bool) {
+	return FindBestHistogramSplitReg(hist, boundaries, totalW, totalWY, 0.0)
+}
+
+// FindBestHistogramSplitReg scans accumulated feature histogram bins to find the split threshold
+// minimizing the L2-regularized negative gain
+//
+//	-(leftWY^2/(leftW+lambda) + rightWY^2/(rightW+lambda)).
+//
+// It panics if lambda is negative, NaN, or infinite.
+func FindBestHistogramSplitReg(hist *FeatureHistogram, boundaries []float64, totalW, totalWY, lambda float64) (float64, float64, bool) {
+	validateHistogramLambda(lambda)
 	numBins := len(boundaries)
 	if numBins <= 1 || hist == nil {
 		return 0.0, math.MaxFloat64, false
@@ -213,7 +232,7 @@ func FindBestHistogramSplit(hist *FeatureHistogram, boundaries []float64, totalW
 			continue
 		}
 
-		score := -((leftWY * leftWY / leftW) + (rightWY * rightWY / rightW))
+		score := -((leftWY * leftWY / (leftW + lambda)) + (rightWY * rightWY / (rightW + lambda)))
 		if math.IsNaN(score) || math.IsInf(score, 0) {
 			continue
 		}
@@ -238,7 +257,19 @@ func FindBestHistogramSplit(hist *FeatureHistogram, boundaries []float64, totalW
 }
 
 // FindBestHistogramSplitWithCounts evaluates the optimal split threshold and partition metrics directly from histogram bins.
+// It is equivalent to FindBestHistogramSplitWithCountsReg with lambda = 0.
 func FindBestHistogramSplitWithCounts(hist *FeatureHistogram, boundaries []float64, totalW, totalWY float64, totalCount int, minChildSamples int) (splitVal float64, score float64, leftW float64, leftWY float64, rightW float64, rightWY float64, found bool) {
+	return FindBestHistogramSplitWithCountsReg(hist, boundaries, totalW, totalWY, totalCount, minChildSamples, 0.0)
+}
+
+// FindBestHistogramSplitWithCountsReg evaluates the optimal split threshold and partition metrics directly from
+// histogram bins using the L2-regularized negative gain
+//
+//	-(leftWY^2/(leftW+lambda) + rightWY^2/(rightW+lambda)).
+//
+// It panics if lambda is negative, NaN, or infinite.
+func FindBestHistogramSplitWithCountsReg(hist *FeatureHistogram, boundaries []float64, totalW, totalWY float64, totalCount int, minChildSamples int, lambda float64) (splitVal float64, score float64, leftW float64, leftWY float64, rightW float64, rightWY float64, found bool) {
+	validateHistogramLambda(lambda)
 	numBins := len(boundaries)
 	if numBins <= 1 || hist == nil {
 		return 0.0, math.MaxFloat64, 0, 0, 0, 0, false
@@ -298,7 +329,7 @@ func FindBestHistogramSplitWithCounts(hist *FeatureHistogram, boundaries []float
 			continue
 		}
 
-		scoreVal := -((curLeftWY * curLeftWY / curLeftW) + (curRightWY * curRightWY / curRightW))
+		scoreVal := -((curLeftWY * curLeftWY / (curLeftW + lambda)) + (curRightWY * curRightWY / (curRightW + lambda)))
 		if math.IsNaN(scoreVal) || math.IsInf(scoreVal, 0) {
 			continue
 		}

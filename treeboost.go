@@ -115,13 +115,6 @@ func (m *Model) ComputeMetrics(X []FeatureVector, Y []float64) {
 	if m == nil || len(X) == 0 || len(Y) == 0 || len(X) != len(Y) {
 		return
 	}
-	n := float64(len(Y))
-	var sumY float64
-	for _, y := range Y {
-		sumY += y
-	}
-	meanY := sumY / n
-
 	nSamples := len(X)
 	nFeatures := len(X[0].Values)
 	flat := make([]float64, nSamples*nFeatures)
@@ -129,7 +122,42 @@ func (m *Model) ComputeMetrics(X []FeatureVector, Y []float64) {
 		offset := i * nFeatures
 		copy(flat[offset:offset+nFeatures], X[i].Values)
 	}
-	preds := m.PredictBatch(flat, nSamples)
+	m.applyMetrics(Y, m.PredictBatch(flat, nSamples))
+}
+
+// computeMetricsColumnar is the ColumnarDataset counterpart of ComputeMetrics, evaluating the model
+// directly on the SoA layout without rebuilding row-oriented feature vectors.
+func (m *Model) computeMetricsColumnar(data ColumnarDataset) {
+	if m == nil || data.NumSamples == 0 || len(data.Targets) != data.NumSamples {
+		return
+	}
+	lr := m.LearningRate
+	if lr == 0.0 {
+		lr = 1.0
+	}
+	preds := make([]float64, data.NumSamples)
+	for i := range preds {
+		preds[i] = m.BaseValue
+	}
+	for _, tree := range m.Trees {
+		if len(tree.Nodes) == 0 {
+			continue
+		}
+		for i := range preds {
+			preds[i] += lr * EvaluateTreeColumnar(tree.Nodes, data, i)
+		}
+	}
+	m.applyMetrics(data.Targets, preds)
+}
+
+// applyMetrics updates MAE, RMSE, RSquared (and PinballLoss for pinball models) from targets Y and predictions preds.
+func (m *Model) applyMetrics(Y []float64, preds []float64) {
+	n := float64(len(Y))
+	var sumY float64
+	for _, y := range Y {
+		sumY += y
+	}
+	meanY := sumY / n
 
 	var maeSum, sse, sst float64
 	for i := 0; i < len(Y); i++ {
