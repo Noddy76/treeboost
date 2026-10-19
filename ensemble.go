@@ -325,11 +325,21 @@ func partitionSamplesInPlace(sampleIdxs []int, start, end int, featureValues []f
 	i := start
 	j := end - 1
 	for i <= j {
-		for i <= j && featureValues[fOffset+sampleIdxs[i]] < splitVal {
-			i++
+		for i <= j {
+			v := featureValues[fOffset+sampleIdxs[i]]
+			if !math.IsNaN(v) && v < splitVal {
+				i++
+			} else {
+				break
+			}
 		}
-		for i <= j && featureValues[fOffset+sampleIdxs[j]] >= splitVal {
-			j--
+		for i <= j {
+			v := featureValues[fOffset+sampleIdxs[j]]
+			if math.IsNaN(v) || v >= splitVal {
+				j--
+			} else {
+				break
+			}
 		}
 		if i < j {
 			sampleIdxs[i], sampleIdxs[j] = sampleIdxs[j], sampleIdxs[i]
