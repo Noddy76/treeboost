@@ -534,3 +534,85 @@ func FuzzQuantizeDataset_HistogramBinning(f *testing.F) {
 		}
 	})
 }
+
+func lambdaTestHistogram() (*FeatureHistogram, []float64, float64, float64) {
+	boundaries := []float64{0.0, 10.0, 20.0, 30.0}
+	weights := []float64{1, 50, 50, 50}
+	wys := []float64{10, 5, -5, -50}
+	hist := &FeatureHistogram{}
+	var totalW, totalWY float64
+	for b := range weights {
+		hist.Count[b] = int(weights[b])
+		hist.SumW[b] = weights[b]
+		hist.SumWY[b] = wys[b]
+		totalW += weights[b]
+		totalWY += wys[b]
+	}
+	return hist, boundaries, totalW, totalWY
+}
+
+func TestHistogramSplitReg_LambdaZeroMatchesLegacy(t *testing.T) {
+	hist, boundaries, totalW, totalWY := lambdaTestHistogram()
+
+	wantVal, wantScore, wantOK := FindBestHistogramSplit(hist, boundaries, totalW, totalWY)
+	gotVal, gotScore, gotOK := FindBestHistogramSplitReg(hist, boundaries, totalW, totalWY, 0.0)
+	if gotVal != wantVal || gotScore != wantScore || gotOK != wantOK {
+		t.Fatalf("Reg(lambda=0) = (%v,%v,%v); legacy = (%v,%v,%v)", gotVal, gotScore, gotOK, wantVal, wantScore, wantOK)
+	}
+
+	w1 := FindBestHistogramSplitWithCounts
+	w2 := FindBestHistogramSplitWithCountsReg
+	v1, s1, lw1, lwy1, rw1, rwy1, ok1 := w1(hist, boundaries, totalW, totalWY, 151, 1)
+	v2, s2, lw2, lwy2, rw2, rwy2, ok2 := w2(hist, boundaries, totalW, totalWY, 151, 1, 0.0)
+	if v1 != v2 || s1 != s2 || lw1 != lw2 || lwy1 != lwy2 || rw1 != rw2 || rwy1 != rwy2 || ok1 != ok2 {
+		t.Fatalf("WithCountsReg(lambda=0) diverges from legacy wrapper")
+	}
+}
+
+func TestHistogramSplitReg_LambdaSuppressesLowWeightOutlierBin(t *testing.T) {
+	hist, boundaries, totalW, totalWY := lambdaTestHistogram()
+
+	// Unregularized: the single-sample outlier bin (W=1, mean 10) wins at boundary 0 (split 5.0).
+	val, _, ok := FindBestHistogramSplitReg(hist, boundaries, totalW, totalWY, 0.0)
+	if !ok || val != 5.0 {
+		t.Fatalf("lambda=0: got split %v (ok=%v), want 5.0", val, ok)
+	}
+
+	// Regularized: the outlier's contribution is shrunk and the well-supported split at boundary 2 wins.
+	val, score, ok := FindBestHistogramSplitReg(hist, boundaries, totalW, totalWY, 5.0)
+	if !ok || val != 25.0 {
+		t.Fatalf("lambda=5: got split %v (ok=%v), want 25.0", val, ok)
+	}
+	leftWY, leftW := 10.0, 101.0 // bins 0..2: WY = 10+5-5, W = 1+50+50
+	rightWY, rightW := -50.0, 50.0
+	want := -((leftWY*leftWY)/(leftW+5.0) + (rightWY*rightWY)/(rightW+5.0))
+	if math.Abs(score-want) > 1e-9 {
+		t.Fatalf("lambda=5 score = %v, want %v", score, want)
+	}
+
+	cVal, _, lw, lwy, rw, rwy, cOK := FindBestHistogramSplitWithCountsReg(hist, boundaries, totalW, totalWY, 151, 1, 5.0)
+	if !cOK || cVal != 25.0 || lw != 101 || lwy != 10 || rw != 50 || rwy != -50 {
+		t.Fatalf("WithCountsReg lambda=5 = (%v, lw=%v, lwy=%v, rw=%v, rwy=%v, ok=%v)", cVal, lw, lwy, rw, rwy, cOK)
+	}
+}
+
+func TestHistogramSplitReg_InvalidLambdaPanics(t *testing.T) {
+	hist, boundaries, totalW, totalWY := lambdaTestHistogram()
+	for _, lambda := range []float64{-1.0, math.NaN(), math.Inf(1)} {
+		for name, fn := range map[string]func(){
+			"Reg": func() { FindBestHistogramSplitReg(hist, boundaries, totalW, totalWY, lambda) },
+			"WithCountsReg": func() {
+				FindBestHistogramSplitWithCountsReg(hist, boundaries, totalW, totalWY, 151, 1, lambda)
+			},
+		} {
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Errorf("%s(lambda=%v) did not panic", name, lambda)
+					}
+				}()
+				fn()
+			}()
+		}
+	}
+}

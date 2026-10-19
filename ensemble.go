@@ -185,7 +185,20 @@ type TrainWorkspace struct {
 	QuantileScratch []int
 	TreeFeatureIdxs []int
 	NodeFeatureIdxs []int
+
+	// LevelScore and LevelHasSplit accumulate, per candidate bin boundary, the level-wide
+	// regularized negative gain (summed across all active nodes of a symmetric tree level) and
+	// whether at least one node is actually divided by that boundary. They are fixed-size
+	// so symmetric level evaluation never allocates.
+	LevelScore    [256]float64
+	LevelHasSplit [256]bool
 }
+
+// minSamplesForIntraTreeParallel is the minimum dataset size for which per-split feature
+// evaluation is fanned out across goroutines. Below this size the cost of goroutine creation
+// and workspace pool traffic exceeds the histogram work, so features are evaluated
+// sequentially on the caller's workspace (leaving cores to outer model-level parallelism).
+const minSamplesForIntraTreeParallel = 4096
 
 var trainWorkspacePool = sync.Pool{
 	New: func() interface{} {
@@ -413,28 +426,118 @@ type splitCandidateResult struct {
 	score   float64
 }
 
+// evaluateSymmetricFeatureSplitsBinned finds the level-optimal oblivious split threshold for feature f
+// over all active nodes [levelStart, levelEnd) using quantized histograms.
+//
+// For every non-empty node a histogram over that node's samples is accumulated and swept once across the
+// bin boundaries, adding the node's L2-regularized negative gain
+//
+//	-(leftWY^2/(leftW+lambda) + rightWY^2/(rightW+lambda))
+//
+// into ws.LevelScore[b]. The boundary b minimizing the level-wide sum is selected. This is mathematically
+// identical to holding a histogram per node and sweeping all nodes together, but reuses a single histogram,
+// so memory stays O(bins) instead of O(2^depth * bins) and the hot path never allocates or scans raw floats.
+func evaluateSymmetricFeatureSplitsBinned(
+	data ColumnarDataset,
+	f int,
+	levelStart, levelEnd int,
+	ranges []nodeRange,
+	sampleIdxs []int,
+	lambda float64,
+	ws *TrainWorkspace,
+) splitCandidateResult {
+	res := splitCandidateResult{feature: -1, val: 0.0, score: math.MaxFloat64}
+	boundaries := data.Binned.BinBoundaries[f]
+	numBins := len(boundaries)
+	if numBins > len(ws.Hist.SumW) {
+		numBins = len(ws.Hist.SumW)
+	}
+	if numBins <= 1 {
+		return res
+	}
+	fOffset := f * data.NumSamples
+
+	for b := 0; b < numBins-1; b++ {
+		ws.LevelScore[b] = 0.0
+		ws.LevelHasSplit[b] = false
+	}
+
+	for nIdx := levelStart; nIdx < levelEnd; nIdx++ {
+		r := ranges[nIdx]
+		if r.end-r.start == 0 {
+			continue
+		}
+		BuildHistogramSlice(data.Binned.Bins, fOffset, data.Weights, data.Targets, sampleIdxs, r.start, r.end, &ws.Hist)
+
+		var totalW, totalWY float64
+		var totalCount int
+		for b := 0; b < numBins; b++ {
+			totalW += ws.Hist.SumW[b]
+			totalWY += ws.Hist.SumWY[b]
+			totalCount += ws.Hist.Count[b]
+		}
+
+		var leftW, leftWY float64
+		var leftCount int
+		for b := 0; b < numBins-1; b++ {
+			leftW += ws.Hist.SumW[b]
+			leftWY += ws.Hist.SumWY[b]
+			leftCount += ws.Hist.Count[b]
+
+			if leftCount > 0 && totalCount-leftCount > 0 {
+				ws.LevelHasSplit[b] = true
+			}
+
+			rightW := totalW - leftW
+			if rightW < 0.0 {
+				rightW = 0.0
+			}
+			rightWY := totalWY - leftWY
+
+			var gain float64
+			if denom := leftW + lambda; denom > 1e-9 {
+				gain += leftWY * leftWY / denom
+			}
+			if denom := rightW + lambda; denom > 1e-9 {
+				gain += rightWY * rightWY / denom
+			}
+			ws.LevelScore[b] -= gain
+		}
+	}
+
+	for b := 0; b < numBins-1; b++ {
+		score := ws.LevelScore[b]
+		if !ws.LevelHasSplit[b] || math.IsNaN(score) || math.IsInf(score, 0) || score >= res.score {
+			continue
+		}
+		val := boundaries[b]*0.5 + boundaries[b+1]*0.5
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			continue
+		}
+		res.score = score
+		res.feature = f
+		res.val = val
+	}
+	return res
+}
+
 func evaluateSymmetricFeatureSplits(
 	data ColumnarDataset,
 	f int,
 	levelStart, levelEnd int,
 	ranges []nodeRange,
 	sampleIdxs []int,
+	lambda float64,
 	ws *TrainWorkspace,
 ) splitCandidateResult {
+	if len(data.Binned.Bins) > 0 {
+		return evaluateSymmetricFeatureSplitsBinned(data, f, levelStart, levelEnd, ranges, sampleIdxs, lambda, ws)
+	}
+
 	res := splitCandidateResult{feature: -1, val: 0.0, score: math.MaxFloat64}
 	fOffset := f * data.NumSamples
 
-	var candidates []float64
-	if len(data.Binned.Bins) > 0 {
-		BuildHistogramSlice(data.Binned.Bins, fOffset, data.Weights, data.Targets, sampleIdxs, 0, data.NumSamples, &ws.Hist)
-		totalW, totalWY := computeWeightedSumContiguous(data.Weights, data.Targets)
-		val, _, ok := FindBestHistogramSplit(&ws.Hist, data.Binned.BinBoundaries[f], totalW, totalWY)
-		if ok {
-			candidates = []float64{val}
-		}
-	} else {
-		candidates = getSplitCandidatesColumnar(data, sampleIdxs[:data.NumSamples], f, ws)
-	}
+	candidates := getSplitCandidatesColumnar(data, sampleIdxs[:data.NumSamples], f, ws)
 	if len(candidates) == 0 {
 		return res
 	}
@@ -555,7 +658,7 @@ func trainSymmetricTreeColumnarWithColsample(ws *TrainWorkspace, data ColumnarDa
 
 		numFeatures := len(evalFeatures)
 		concurrency := runtime.GOMAXPROCS(0)
-		if numFeatures >= 8 && concurrency > 1 {
+		if data.NumSamples >= minSamplesForIntraTreeParallel && numFeatures >= 8 && concurrency > 1 {
 			// Intra-tree parallel split search across features
 			numWorkers := concurrency
 			if numWorkers > numFeatures {
@@ -585,7 +688,7 @@ func trainSymmetricTreeColumnarWithColsample(ws *TrainWorkspace, data ColumnarDa
 					workerBest := splitCandidateResult{feature: -1, score: math.MaxFloat64}
 					for idx := startIdx; idx < endIdx; idx++ {
 						feat := evalFeatures[idx]
-						candRes := evaluateSymmetricFeatureSplits(data, feat, levelStart, levelEnd, ws.Ranges, ws.SampleIdxs, tws)
+						candRes := evaluateSymmetricFeatureSplits(data, feat, levelStart, levelEnd, ws.Ranges, ws.SampleIdxs, lambda, tws)
 						if candRes.feature != -1 && candRes.score < workerBest.score {
 							workerBest = candRes
 						}
@@ -605,7 +708,7 @@ func trainSymmetricTreeColumnarWithColsample(ws *TrainWorkspace, data ColumnarDa
 		} else {
 			// Sequential evaluation on caller's workspace
 			for _, f := range evalFeatures {
-				candRes := evaluateSymmetricFeatureSplits(data, f, levelStart, levelEnd, ws.Ranges, ws.SampleIdxs, ws)
+				candRes := evaluateSymmetricFeatureSplits(data, f, levelStart, levelEnd, ws.Ranges, ws.SampleIdxs, lambda, ws)
 				if candRes.feature != -1 && candRes.score < bestScore {
 					bestScore = candRes.score
 					bestFeature = candRes.feature
@@ -963,8 +1066,8 @@ func evaluateLeafwiseFeatureSplits(
 
 		if len(data.Binned.Bins) > 0 {
 			BuildHistogramSlice(data.Binned.Bins, fOffset, data.Weights, data.Targets, sampleIdxs, leaf.start, leaf.end, &ws.Hist)
-			val, _, leftW, leftWY, rightW, rightWY, ok := FindBestHistogramSplitWithCounts(
-				&ws.Hist, data.Binned.BinBoundaries[f], leaf.sumW, leaf.sumWY, nSamples, minChildSamples)
+			val, _, leftW, leftWY, rightW, rightWY, ok := FindBestHistogramSplitWithCountsReg(
+				&ws.Hist, data.Binned.BinBoundaries[f], leaf.sumW, leaf.sumWY, nSamples, minChildSamples, lambda)
 			if !ok {
 				continue
 			}
@@ -1134,7 +1237,7 @@ func trainLeafwiseTreeColumnarWithColsample(ws *TrainWorkspace, data ColumnarDat
 
 		numFeatures := len(evalFeatures)
 		concurrency := runtime.GOMAXPROCS(0)
-		if numFeatures >= 8 && concurrency > 1 {
+		if data.NumSamples >= minSamplesForIntraTreeParallel && numFeatures >= 8 && concurrency > 1 {
 			// Intra-tree parallel split search across features
 			numWorkers := concurrency
 			if numWorkers > numFeatures {
@@ -1738,7 +1841,8 @@ func ScaleTreeLeavesInPlace(tree *Tree, factor float64) {
 	}
 }
 
-func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, config EnsembleConfig) *Model {
+// validateEnsembleConfig fails fast on invalid early stopping and colsample settings.
+func validateEnsembleConfig(config EnsembleConfig) {
 	validateEarlyStopping(config.EarlyStoppingPatience)
 	validateEarlyStopping(config.CatBoost.EarlyStoppingPatience)
 	validateEarlyStopping(config.LightGBM.EarlyStoppingPatience)
@@ -1760,6 +1864,12 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 	if config.LightGBM.ColsampleByNode != 0.0 {
 		validateColsample("colsample_bynode", config.LightGBM.ColsampleByNode)
 	}
+}
+
+// TrainEnsembleWithWeights trains a multi-algorithm tree ensemble on row-oriented feature vectors X.
+// It converts X to a pre-binned ColumnarDataset once and delegates to TrainEnsembleColumnar.
+func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, config EnsembleConfig) *Model {
+	validateEnsembleConfig(config)
 
 	if len(X) != len(Y) {
 		panic(fmt.Sprintf("treeboost: length mismatch: len(X)=%d != len(Y)=%d", len(X), len(Y)))
@@ -1773,6 +1883,45 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 			W[i] = 1.0
 		}
 	}
+
+	return TrainEnsembleColumnar(ToColumnar(X, Y, W), config)
+}
+
+// TrainEnsembleColumnar trains a multi-algorithm tree ensemble (CatBoost-style symmetric GBDT,
+// LightGBM-style leaf-wise GBDT, and ExtraTrees) directly on a ColumnarDataset.
+//
+// If data.Binned.Bins is already populated the pre-binned uint8 matrix is reused as-is (it is only
+// read, so callers may share one ColumnarDataset across concurrent trainings without re-sorting).
+// Otherwise the dataset is quantized into 256 equal-frequency bins. Nil data.Weights default to 1.0.
+// The caller's dataset is never mutated.
+func TrainEnsembleColumnar(data ColumnarDataset, config EnsembleConfig) *Model {
+	validateEnsembleConfig(config)
+
+	n := data.NumSamples
+	if len(data.Targets) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Targets)=%d != NumSamples=%d", len(data.Targets), n))
+	}
+	if len(data.Weights) > 0 && len(data.Weights) != n {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Weights)=%d != NumSamples=%d", len(data.Weights), n))
+	}
+	if n > 0 && len(data.Features) != n*data.NumFeatures {
+		panic(fmt.Sprintf("treeboost: length mismatch: len(Features)=%d != NumSamples*NumFeatures=%d", len(data.Features), n*data.NumFeatures))
+	}
+	if len(data.Weights) == 0 && n > 0 {
+		data.Weights = make([]float64, n)
+		for i := range data.Weights {
+			data.Weights[i] = 1.0
+		}
+	}
+	if len(data.Binned.Bins) == 0 {
+		if n > 0 {
+			data.Binned = QuantizeDataset(data, 256)
+		}
+	} else if data.Binned.NumSamples != n || data.Binned.NumFeatures != data.NumFeatures || len(data.Binned.Bins) != n*data.NumFeatures {
+		panic(fmt.Sprintf("treeboost: pre-binned dataset shape (%d samples x %d features) does not match columnar dataset (%d x %d)",
+			data.Binned.NumSamples, data.Binned.NumFeatures, n, data.NumFeatures))
+	}
+
 	if config.LossFunction == LossPinball {
 		validateQuantileParams(config.LossFunction, config.Quantile)
 		if config.CatBoost.LossFunction == "" {
@@ -1838,8 +1987,6 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 		lgbParams.ValidationW = config.ValidationW
 	}
 
-	data := ToColumnar(X, Y, W)
-
 	maxLeaf := resolveMaxLeafValue(config.MaxLeafValue)
 	if cbParams.MaxLeafValue <= 0.0 || cbParams.MaxLeafValue > maxLeaf || math.IsNaN(cbParams.MaxLeafValue) || math.IsInf(cbParams.MaxLeafValue, 0) {
 		cbParams.MaxLeafValue = maxLeaf
@@ -1903,7 +2050,7 @@ func TrainEnsembleWithWeights(X []FeatureVector, Y []float64, W []float64, confi
 		LossFunction: config.LossFunction,
 		Quantile:     config.Quantile,
 	}
-	model.ComputeMetrics(X, Y)
+	model.computeMetricsColumnar(data)
 	return model
 }
 
@@ -1922,12 +2069,14 @@ func TrainQuantileEnsembleWithWeights(X []FeatureVector, Y []float64, W []float6
 	if len(W) > 0 && len(W) != len(Y) {
 		panic(fmt.Sprintf("treeboost: length mismatch: len(W)=%d != len(Y)=%d", len(W), len(Y)))
 	}
-	if len(W) == 0 && len(Y) > 0 {
-		W = make([]float64, len(Y))
-		for i := range W {
-			W[i] = 1.0
-		}
-	}
+	return TrainQuantileEnsembleColumnar(ToColumnar(X, Y, W), quantile, config)
+}
+
+// TrainQuantileEnsembleColumnar trains a multi-algorithm quantile regression ensemble for target
+// quantile directly on a ColumnarDataset. Pre-binned data is reused without re-sorting; see
+// TrainEnsembleColumnar for the dataset contract.
+func TrainQuantileEnsembleColumnar(data ColumnarDataset, quantile float64, config EnsembleConfig) *Model {
+	validateQuantileParams(LossPinball, quantile)
 
 	config.LossFunction = LossPinball
 	config.Quantile = quantile
@@ -1952,7 +2101,7 @@ func TrainQuantileEnsembleWithWeights(X []FeatureVector, Y []float64, W []float6
 		}
 	}
 
-	return TrainEnsembleWithWeights(X, Y, W, config)
+	return TrainEnsembleColumnar(data, config)
 }
 
 // TrainQuantileEnsemble trains a multi-algorithm quantile regression ensemble
